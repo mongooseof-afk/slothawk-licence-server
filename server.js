@@ -125,7 +125,8 @@ const server = http.createServer(async (req, res) => {
         [id, key, username, plan, duration, expiresAt]
       );
       console.log(`[GENERATE] key=${key}`);
-      return json(res, 200, { ok: true, key, license_key: key, id, duration_days: duration });
+      const licenceObj = { id, license_key: key, username, plan, status: "pending", duration, expires_at: expiresAt };
+      return json(res, 200, { ok: true, key, license_key: key, id, duration_days: duration, licences: [licenceObj] });
     } catch (err) {
       console.error("[GENERATE] error:", err.message);
       return json(res, 500, { ok: false, error: err.message });
