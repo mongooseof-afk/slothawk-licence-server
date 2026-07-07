@@ -180,7 +180,19 @@ const server = http.createServer(async (req, res) => {
     } catch (err) { return json(res, 500, { ok: false, error: err.message }); }
   }
 
-  // ── DELETE /api/admin/licences/:id ───────────────────────────────────────────
+  // ── GET /admin/licences/:id ───────────────────────────────────────────────────
+  if (req.method === "GET" && (url.match(/\/api\/admin\/licences\/.+/) || url.match(/\/admin\/licences\/.+/))) {
+    const id = url.split("/").pop();
+    try {
+      const { rows } = await pool.query(`SELECT * FROM licences WHERE id = $1 OR license_key = $1`, [id]);
+      if (!rows.length) return json(res, 404, { ok: false, error: "Licence not found" });
+      return json(res, 200, { ok: true, licence: rows[0], ...rows[0] });
+    } catch (err) {
+      return json(res, 500, { ok: false, error: err.message });
+    }
+  }
+
+  // ── DELETE /admin/licences/:id ────────────────────────────────────────────────
   if (req.method === "DELETE" && (url.startsWith("/api/admin/licences/") || url.startsWith("/admin/licences/"))) {
     const id = url.split("/")[4];
     try {
