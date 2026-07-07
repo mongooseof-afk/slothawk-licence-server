@@ -146,7 +146,7 @@ const server = http.createServer(async (req, res) => {
 
   // ── PATCH /api/admin/licences/:id/revoke ─────────────────────────────────────
   if (req.method === "PATCH" && url.includes("/revoke")) {
-    const id = url.split("/")[4];
+    const id = url.split("/").filter(Boolean).pop();
     try {
       await pool.query(`UPDATE licences SET status = 'revoked' WHERE id = $1 OR license_key = $1`, [id]);
       return json(res, 200, { ok: true });
@@ -155,7 +155,7 @@ const server = http.createServer(async (req, res) => {
 
   // ── PATCH /api/admin/licences/:id/reset-machine ──────────────────────────────
   if (req.method === "PATCH" && url.includes("/reset-machine")) {
-    const id = url.split("/")[4];
+    const id = url.split("/").filter(Boolean).pop();
     try {
       await pool.query(`UPDATE licences SET machine_id = NULL WHERE id = $1 OR license_key = $1`, [id]);
       return json(res, 200, { ok: true });
@@ -164,7 +164,7 @@ const server = http.createServer(async (req, res) => {
 
   // ── PATCH /api/admin/licences/:id/reactivate ─────────────────────────────────
   if (req.method === "PATCH" && url.includes("/reactivate")) {
-    const id = url.split("/")[4];
+    const id = url.split("/").filter(Boolean).pop();
     try {
       await pool.query(`UPDATE licences SET status = 'active', deactivated = FALSE WHERE id = $1 OR license_key = $1`, [id]);
       return json(res, 200, { ok: true });
@@ -173,7 +173,7 @@ const server = http.createServer(async (req, res) => {
 
   // ── PATCH /api/admin/licences/:id/deactivate ─────────────────────────────────
   if (req.method === "PATCH" && url.includes("/deactivate")) {
-    const id = url.split("/")[4];
+    const id = url.split("/").filter(Boolean).pop();
     try {
       await pool.query(`UPDATE licences SET status = 'inactive', deactivated = TRUE WHERE id = $1 OR license_key = $1`, [id]);
       return json(res, 200, { ok: true });
@@ -194,7 +194,7 @@ const server = http.createServer(async (req, res) => {
 
   // ── DELETE /admin/licences/:id ────────────────────────────────────────────────
   if (req.method === "DELETE" && (url.startsWith("/api/admin/licences/") || url.startsWith("/admin/licences/"))) {
-    const id = url.split("/")[4];
+    const id = url.split("/").filter(Boolean).pop();
     try {
       await pool.query(`DELETE FROM licences WHERE id = $1 OR license_key = $1`, [id]);
       return json(res, 200, { ok: true });
