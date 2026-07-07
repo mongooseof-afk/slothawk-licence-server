@@ -1,18 +1,16 @@
 {
-  "name": "slothawk_license_server",
-  "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "name": "slothawk-ws",
+  "version": "0.2.0",
+  "main": "server.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node server.js",
+    "build": "pkg server.js --target node18-win-x64 --output SlotHawkWS.exe"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "pkg": {
+    "assets": [],
+    "targets": ["node18-win-x64"]
+  },
   "dependencies": {
-    "express": "^5.2.1",
-    "jsonwebtoken": "^9.0.3",
-    "pg": "^8.13.0"
-  },
-  "type": "module"
+    "ws": "^8.18.0"
+  }
 }

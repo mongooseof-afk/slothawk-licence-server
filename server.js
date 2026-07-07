@@ -1,280 +1,184 @@
-import express from "express";
-import jwt from "jsonwebtoken";
-import crypto from "crypto";
-import {
-  getLicense, getLicenseById, createLicense, bindMachine,
-  extendLicense, revokeLicense, reactivateLicense, deactivateLicense, resetMachine,
-  deleteLicense, listLicenses, generateKey, updateHeartbeat,
-  normalizeIp, flagSuspicious, clearBlock, addBookingEvent,
-} from "./db.js";
+"use strict";
 
-const PORT = process.env.PORT || 8766;
-const MIN_EXTENSION_VERSION = process.env.MIN_VERSION || "0.1.58";
-let JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(48).toString("hex");
-const JWT_EXPIRY = "7d";
+const { createServer }    = require("http");
+const { WebSocketServer } = require("ws");
+const { createCipheriv, createDecipheriv, createHash, randomBytes } = require("crypto");
+const { existsSync, mkdirSync, readFileSync, writeFileSync } = require("fs");
+const { join }            = require("path");
+const { homedir, hostname, platform, arch } = require("os");
+const { execSync }        = require("child_process");
 
-const app = express();
-app.set("trust proxy", true);
-app.use(express.json());
+// ── Terminal branding ─────────────────────────────────────────────────────────
+if (process.platform === "win32") process.title = "SlotHawk by Mongoose";
+console.clear();
+console.log("  SlotHawk by Mongoose");
+process.stdin.resume();
 
-app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, x-api-key");
-  if (req.method === "OPTIONS") return res.sendStatus(204);
-  next();
-});
-
-function isExpired(expiresAt) {
-  return expiresAt && new Date(expiresAt).getTime() < Date.now();
+// ── Windows startup registration ──────────────────────────────────────────────
+function autoRegister() {
+  if (process.platform !== "win32") return;
+  try {
+    const exe = process.execPath;
+    execSync(
+      `REG ADD "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" /v "SlotHawkWS" /t REG_SZ /d "${exe}" /f`,
+      { stdio: "ignore" }
+    );
+  } catch {}
 }
 
-async function findLicense(keyOrId) {
-  return (await getLicense(keyOrId)) || (await getLicenseById(keyOrId)) || null;
+autoRegister();
+
+// ── sys.dat ───────────────────────────────────────────────────────────────────
+const APP_DIR = join(homedir(), "AppData", "Local", "SlotHawk");
+const SYS_DAT = join(APP_DIR, "sys.dat");
+
+function aesKey() {
+  return createHash("sha256").update(hostname() + platform() + arch()).digest();
 }
 
-function signToken(payload) {
-  return jwt.sign(payload, JWT_SECRET, { expiresIn: JWT_EXPIRY });
+function encrypt(text) {
+  const iv     = randomBytes(16);
+  const cipher = createCipheriv("aes-256-cbc", aesKey(), iv);
+  const enc    = Buffer.concat([cipher.update(text, "utf8"), cipher.final()]);
+  return iv.toString("hex") + ":" + enc.toString("hex");
 }
 
-function verifyToken(token) {
-  try { return jwt.verify(token, JWT_SECRET); }
+function decrypt(text) {
+  const [ivHex, encHex] = text.split(":");
+  const decipher = createDecipheriv("aes-256-cbc", aesKey(), Buffer.from(ivHex, "hex"));
+  return Buffer.concat([
+    decipher.update(Buffer.from(encHex, "hex")),
+    decipher.final(),
+  ]).toString("utf8");
+}
+
+function readSysDat() {
+  try { return JSON.parse(decrypt(readFileSync(SYS_DAT, "utf8"))); }
   catch { return null; }
 }
 
-// ── Machine ID ────────────────────────────────────────────────────────────────
-app.get("/machine", (req, res) => {
-  // On Render, machine_id comes from the DB (per licence), not from a local file.
-  // This endpoint is only used by the local sync server — on Render it is not
-  // needed but we return a stable ID for backward compatibility.
-  res.json({ ok: true, machine_id: "render-server" });
+function writeSysDat(data) {
+  if (!existsSync(APP_DIR)) mkdirSync(APP_DIR, { recursive: true });
+  writeFileSync(SYS_DAT, encrypt(JSON.stringify(data)), "utf8");
+}
+
+// ── machine_id — SHA256(MachineGuid + ComputerName) ──────────────────────────
+function generateMachineId() {
+  let machineGuid    = "";
+  const computerName = hostname();
+
+  if (process.platform === "win32") {
+    try {
+      const out   = execSync(
+        'REG QUERY "HKLM\\SOFTWARE\\Microsoft\\Cryptography" /v MachineGuid',
+        { encoding: "utf8", stdio: ["pipe", "pipe", "ignore"] }
+      );
+      const match = out.match(/MachineGuid\s+REG_SZ\s+(.+)/);
+      if (match) machineGuid = match[1].trim();
+    } catch {}
+  }
+
+  return "mach-" + createHash("sha256")
+    .update(machineGuid + computerName)
+    .digest("hex")
+    .slice(0, 32);
+}
+
+function getMachineId() {
+  const stored = readSysDat();
+  if (stored && stored.machine_id) return stored.machine_id;
+
+  const machine_id = generateMachineId();
+  writeSysDat({
+    machine_id,
+    created_at: new Date().toISOString().slice(0, 10),
+    version:    "0.2.0",
+  });
+  return machine_id;
+}
+
+const MACHINE_ID = getMachineId();
+
+// ── HTTP API — port 8766 (127.0.0.1 only) ────────────────────────────────────
+const httpApi = createServer((req, res) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Content-Type", "application/json");
+
+  if (req.method === "GET" && req.url === "/machine") {
+    res.writeHead(200);
+    return res.end(JSON.stringify({ ok: true, machine_id: MACHINE_ID }));
+  }
+
+  if (req.method === "GET" && req.url === "/status") {
+    res.writeHead(200);
+    return res.end(JSON.stringify({ ok: true }));
+  }
+
+  res.writeHead(404);
+  res.end(JSON.stringify({ ok: false }));
 });
 
-// ── Health ────────────────────────────────────────────────────────────────────
-app.get("/health", (req, res) => {
-  res.json({ status: "ok", version: "5.0.0", requiredExtensionVersion: MIN_EXTENSION_VERSION });
+httpApi.listen(8766, "127.0.0.1");
+
+// ── WebSocket sync server — port 8765 ────────────────────────────────────────
+const httpSync = createServer((req, res) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+
+  if (req.method === "GET" && req.url === "/status") {
+    const counts = { mlt: 0, aut: 0 };
+    for (const info of clients.values()) {
+      const m = info.mission;
+      if (!m) continue;
+      if (m in counts) counts[m]++;
+      else counts[m] = 1;
+    }
+    // total = all connected clients
+    const total = clients.size;
+    res.setHeader("Content-Type", "application/json");
+    res.writeHead(200);
+    return res.end(JSON.stringify({ ok: true, counts, total }));
+  }
+
+  res.writeHead(404);
+  res.end();
 });
 
-app.get("/version", (req, res) => {
-  res.json({ required: MIN_EXTENSION_VERSION });
-});
+const wss     = new WebSocketServer({ server: httpSync });
+const clients = new Map();
 
-// ── Extension: activate ───────────────────────────────────────────────────────
-app.post("/activate-licence", async (req, res) => {
-  try {
-    const { key, machine_id, browser_info } = req.body || {};
-    if (!key || !machine_id) return res.json({ ok: false, reason: "missing_fields" });
+wss.on("connection", (ws) => {
+  clients.set(ws, { mission: null, label: "unregistered" });
 
-    const lic = await getLicense(key);
-    if (!lic)                        return res.json({ ok: false, reason: "invalid_key" });
-    if (!lic.active || lic.status === "revoked") return res.json({ ok: false, reason: "revoked" });
-    if (lic.deactivated)             return res.json({ ok: false, reason: "deactivated" });
-    if (isExpired(lic.expiresAt))    return res.json({ ok: false, reason: "expired" });
-    if (lic.machineId && lic.machineId !== machine_id) return res.json({ ok: false, reason: "machine_blocked" });
-    if (lic.blocked)                 return res.json({ ok: false, reason: "blocked_new_device" });
+  ws.on("message", (raw) => {
+    let msg;
+    try { msg = JSON.parse(raw.toString()); } catch { return; }
 
-    const knownDevices = lic.knownDevices || [];
-    const isNewMachine = knownDevices.length > 0 && !knownDevices.some(d => d.machineId === machine_id);
-    if (isNewMachine && !lic.machineId) {
-      await flagSuspicious(key, machine_id, normalizeIp(req.ip));
-      return res.json({ ok: false, reason: "blocked_new_device" });
+    if (msg.type === "register") {
+      clients.set(ws, { mission: msg.mission, label: msg.label || msg.mission });
+      return;
     }
 
-    await bindMachine(key, machine_id, req.ip);
-    await updateHeartbeat(key, machine_id, browser_info?.extension_version || null, req.ip);
-    const token = signToken({ key, machine_id });
-    res.json({ ok: true, token, expiresAt: (await getLicense(key))?.expiresAt || null });
-  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
-});
+    if (msg.type === "slot_found") {
+      const sender  = clients.get(ws);
+      const mission = msg.mission || (sender && sender.mission);
+      if (!mission) return;
 
-// ── Extension: validate ───────────────────────────────────────────────────────
-app.post("/validate-licence", async (req, res) => {
-  try {
-    const { token, key } = req.body || {};
-    if (!token) return res.json({ ok: false, reason: "no_token" });
-    const payload = verifyToken(token);
-    if (!payload) return res.json({ ok: false, reason: "invalid_token" });
-    if (key && payload.key !== key) return res.json({ ok: false, reason: "key_mismatch" });
-    const lic = await getLicense(payload.key);
-    if (!lic || !lic.active || lic.status === "revoked" || lic.deactivated)
-      return res.json({ ok: false, reason: !lic ? "invalid_key" : lic.deactivated ? "deactivated" : "revoked" });
-    if (isExpired(lic.expiresAt)) return res.json({ ok: false, reason: "expired" });
-    if (lic.machineId !== payload.machine_id) return res.json({ ok: false, reason: "machine_reset" });
-    res.json({ ok: true, expiresAt: lic.expiresAt });
-  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
-});
-
-// ── Extension: heartbeat ──────────────────────────────────────────────────────
-app.post("/heartbeat", async (req, res) => {
-  try {
-    const { token, machine_id, extension_version } = req.body || {};
-    if (!token) return res.json({ ok: false, reason: "no_token" });
-    const payload = verifyToken(token);
-    if (!payload) return res.json({ ok: false, reason: "invalid_token" });
-    const lic = await getLicense(payload.key);
-    if (!lic || !lic.active || lic.status === "revoked" || lic.deactivated)
-      return res.json({ ok: false, reason: !lic ? "invalid_key" : lic.deactivated ? "deactivated" : "revoked" });
-    if (isExpired(lic.expiresAt)) return res.json({ ok: false, reason: "expired" });
-    if (lic.machineId !== payload.machine_id) return res.json({ ok: false, reason: "machine_reset" });
-    await updateHeartbeat(payload.key, machine_id, extension_version, req.ip);
-    res.json({ ok: true, expiresAt: lic.expiresAt });
-  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
-});
-
-// ── Extension: refresh token ──────────────────────────────────────────────────
-app.post("/refresh-token", async (req, res) => {
-  try {
-    const { token, machine_id } = req.body || {};
-    if (!token) return res.json({ ok: false, reason: "no_token" });
-    const payload = verifyToken(token);
-    if (!payload) return res.json({ ok: false, reason: "invalid_token" });
-    const lic = await getLicense(payload.key);
-    if (!lic || !lic.active || lic.status === "revoked" || lic.deactivated)
-      return res.json({ ok: false, reason: !lic ? "invalid_key" : lic.deactivated ? "deactivated" : "revoked" });
-    if (isExpired(lic.expiresAt)) return res.json({ ok: false, reason: "expired" });
-    if (lic.machineId !== payload.machine_id) return res.json({ ok: false, reason: "machine_reset" });
-    const newToken = signToken({ key: payload.key, machine_id: machine_id || payload.machine_id });
-    res.json({ ok: true, token: newToken });
-  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
-});
-
-// ── Extension: booking event ──────────────────────────────────────────────────
-app.post("/booking-event", async (req, res) => {
-  try {
-    const { token, success, mission, slot_date, reason } = req.body || {};
-    if (!token) return res.json({ ok: false, reason: "no_token" });
-    const payload = verifyToken(token);
-    if (!payload) return res.json({ ok: false, reason: "invalid_token" });
-    await addBookingEvent(payload.key, { success, mission, slotDate: slot_date, reason, machineId: payload.machine_id, ip: req.ip });
-    res.json({ ok: true });
-  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
-});
-
-// ── Admin: list ───────────────────────────────────────────────────────────────
-app.get("/admin/licences", async (req, res) => {
-  try {
-    const { search = "", status = "all", page = "1", limit = "25", sortBy = "created_at", sortOrder = "desc" } = req.query;
-    const result = await listLicenses({
-      search: String(search), status: String(status),
-      sortBy: String(sortBy), sortOrder: String(sortOrder),
-      page: Math.max(1, parseInt(String(page))),
-      limit: Math.min(100, Math.max(1, parseInt(String(limit)))),
-    });
-    res.json(result);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// ── Admin: get one ────────────────────────────────────────────────────────────
-app.get("/admin/licences/:key", async (req, res) => {
-  try {
-    const lic = await findLicense(req.params.key);
-    if (!lic) return res.status(404).json({ error: "Licence not found." });
-    res.json(lic);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// ── Admin: generate ───────────────────────────────────────────────────────────
-app.post("/admin/licences/generate", async (req, res) => {
-  try {
-    const { duration = 30, quantity = 1, username = "" } = req.body || {};
-    if (quantity < 1 || quantity > 100) return res.status(400).json({ error: "quantity must be 1-100" });
-    if (duration < 1 || duration > 3650) return res.status(400).json({ error: "duration must be 1-3650 days" });
-    const licences = [];
-    for (let i = 0; i < quantity; i++) {
-      const lic = await createLicense({ duration, username });
-      licences.push({ key: lic.key, username: lic.username });
+      for (const [client, info] of clients.entries()) {
+        if (client === ws)                      continue;
+        if (info.mission !== mission)           continue;
+        if (client.readyState !== client.OPEN) continue;
+        client.send(JSON.stringify({
+          type:        "slot_found",
+          mission,
+          city:        msg.city,
+          subcategory: msg.subcategory,
+          from:        (sender && sender.label) || "unknown",
+        }));
+      }
     }
-    res.status(201).json({ licences });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  ws.on("close", () => clients.delete(ws));
 });
 
-// ── Admin: extend ─────────────────────────────────────────────────────────────
-app.patch("/admin/licences/:key/extend", async (req, res) => {
-  try {
-    const { days } = req.body || {};
-    if (!days || days < 1) return res.status(400).json({ error: "days must be >= 1" });
-    const lic = await findLicense(req.params.key);
-    if (!lic) return res.status(404).json({ error: "Licence not found." });
-    res.json({ ok: true, licence: await extendLicense(lic.licenseKey, days) });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// ── Admin: revoke ─────────────────────────────────────────────────────────────
-app.patch("/admin/licences/:key/revoke", async (req, res) => {
-  try {
-    const lic = await findLicense(req.params.key);
-    if (!lic) return res.status(404).json({ error: "Licence not found." });
-    res.json({ ok: true, licence: await revokeLicense(lic.licenseKey) });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.post("/admin/licences/:key/revoke", async (req, res) => {
-  try {
-    const lic = await findLicense(req.params.key);
-    if (!lic) return res.status(404).json({ error: "Licence not found." });
-    res.json({ ok: true, licence: await revokeLicense(lic.licenseKey) });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// ── Admin: reactivate ─────────────────────────────────────────────────────────
-app.patch("/admin/licences/:key/reactivate", async (req, res) => {
-  try {
-    const lic = await findLicense(req.params.key);
-    if (!lic) return res.status(404).json({ error: "Licence not found." });
-    res.json({ ok: true, licence: await reactivateLicense(lic.licenseKey) });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// ── Admin: reset machine ──────────────────────────────────────────────────────
-app.patch("/admin/licences/:key/reset-machine", async (req, res) => {
-  try {
-    const lic = await findLicense(req.params.key);
-    if (!lic) return res.status(404).json({ error: "Licence not found." });
-    res.json({ ok: true, licence: await resetMachine(lic.licenseKey) });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// ── Admin: deactivate ─────────────────────────────────────────────────────────
-app.patch("/admin/licences/:key/deactivate", async (req, res) => {
-  try {
-    const lic = await findLicense(req.params.key);
-    if (!lic) return res.status(404).json({ error: "Licence not found." });
-    res.json({ ok: true, licence: await deactivateLicense(lic.licenseKey) });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// ── Admin: clear block ────────────────────────────────────────────────────────
-app.patch("/admin/licences/:key/clear-block", async (req, res) => {
-  try {
-    const lic = await findLicense(req.params.key);
-    if (!lic) return res.status(404).json({ error: "Licence not found." });
-    res.json({ ok: true, licence: await clearBlock(lic.licenseKey) });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// ── Admin: delete ─────────────────────────────────────────────────────────────
-app.delete("/admin/licences/:key", async (req, res) => {
-  try {
-    const lic = await findLicense(req.params.key);
-    if (!lic) return res.status(404).json({ error: "Licence not found." });
-    await deleteLicense(lic.licenseKey);
-    res.json({ ok: true, message: "Licence deleted." });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// ── Admin: create (curl helper) ───────────────────────────────────────────────
-app.post("/admin/licences", async (req, res) => {
-  try {
-    const { licenseKey, duration, plan, notes, username } = req.body || {};
-    const lic = await createLicense({ licenseKey, duration, plan, notes, username });
-    res.json({ ok: true, licence: lic });
-  } catch (e) { res.status(e.message?.includes("already exists") ? 409 : 500).json({ ok: false, error: e.message }); }
-});
-
-app.get("/", (req, res) => {
-  res.json({ ok: true, service: "SlotHawk License Server", version: "5.0.0" });
-});
-
-app.listen(PORT, () => {
-  console.log(`SlotHawk License Server v5 listening on port ${PORT}`);
-});
+httpSync.listen(8765);
