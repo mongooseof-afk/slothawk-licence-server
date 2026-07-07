@@ -137,7 +137,8 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "GET" && (url === "/api/admin/licences" || url === "/admin/licences")) {
     try {
       const { rows } = await pool.query(`SELECT * FROM licences ORDER BY created_at DESC LIMIT 100`);
-      return json(res, 200, { ok: true, licences: rows, total: rows.length });
+      const total = rows.length;
+      return json(res, 200, { data: rows, licences: rows, total, page: 1, limit: 100, totalPages: 1 });
     } catch (err) {
       return json(res, 500, { ok: false, error: err.message });
     }
