@@ -109,8 +109,8 @@ const server = http.createServer(async (req, res) => {
     return json(res, 200, { ok: true, counts: { mlt: 0, aut: 0 } });
   }
 
-  // ── POST /api/admin/licences/generate ────────────────────────────────────────
-  if (req.method === "POST" && url === "/api/admin/licences/generate") {
+  // ── POST /admin/licences/generate OR /api/admin/licences/generate ────────────
+  if (req.method === "POST" && (url === "/api/admin/licences/generate" || url === "/admin/licences/generate")) {
     const body     = await readBody(req);
     const duration = parseInt(body.duration_days || body.duration) || 30;
     const username = body.username || "";
@@ -133,7 +133,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   // ── GET /api/admin/licences ───────────────────────────────────────────────────
-  if (req.method === "GET" && url.startsWith("/api/admin/licences") && !url.match(/\/api\/admin\/licences\/.+/)) {
+  if (req.method === "GET" && (url === "/api/admin/licences" || url === "/admin/licences")) {
     try {
       const { rows } = await pool.query(`SELECT * FROM licences ORDER BY created_at DESC LIMIT 100`);
       return json(res, 200, { ok: true, licences: rows, total: rows.length });
@@ -179,7 +179,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   // ── DELETE /api/admin/licences/:id ───────────────────────────────────────────
-  if (req.method === "DELETE" && url.startsWith("/api/admin/licences/")) {
+  if (req.method === "DELETE" && (url.startsWith("/api/admin/licences/") || url.startsWith("/admin/licences/"))) {
     const id = url.split("/")[4];
     try {
       await pool.query(`DELETE FROM licences WHERE id = $1 OR license_key = $1`, [id]);
