@@ -136,7 +136,7 @@ const server = http.createServer(async (req, res) => {
   // ── GET /api/admin/licences ───────────────────────────────────────────────────
   if (req.method === "GET" && (url === "/api/admin/licences" || url === "/admin/licences")) {
     try {
-      const { rows } = await pool.query(`SELECT *, license_key AS licence_key FROM licences ORDER BY created_at DESC LIMIT 100`);
+      const { rows } = await pool.query(`SELECT *, license_key AS licence_key, license_key AS "licenceKey", license_key AS key FROM licences ORDER BY created_at DESC LIMIT 100`);
       const total = rows.length;
       return json(res, 200, { data: rows, licences: rows, total, page: 1, limit: 100, totalPages: 1 });
     } catch (err) {
@@ -184,7 +184,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "GET" && (url.match(/\/api\/admin\/licences\/.+/) || url.match(/\/admin\/licences\/.+/))) {
     const id = url.split("/").pop();
     try {
-      const { rows } = await pool.query(`SELECT *, license_key AS licence_key FROM licences WHERE id = $1 OR license_key = $1`, [id]);
+      const { rows } = await pool.query(`SELECT *, license_key AS licence_key, license_key AS "licenceKey", license_key AS key FROM licences WHERE id = $1 OR license_key = $1`, [id]);
       if (!rows.length) return json(res, 404, { ok: false, error: "Licence not found" });
       return json(res, 200, { ok: true, licence: rows[0], ...rows[0] });
     } catch (err) {
