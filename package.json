@@ -1,16 +1,15 @@
 {
-  "name": "slothawk-ws",
-  "version": "0.2.0",
+  "name": "slothawk_license_server",
+  "version": "7.0.0",
+  "description": "SlotHawk Licence Server v7",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "build": "pkg server.js --target node18-win-x64 --output SlotHawkWS.exe"
-  },
-  "pkg": {
-    "assets": [],
-    "targets": ["node18-win-x64"]
+    "start": "node server.js"
   },
   "dependencies": {
-    "ws": "^8.18.0"
+    "dotenv": "^16.0.0",
+    "jsonwebtoken": "^9.0.3",
+    "pg": "^8.13.0",
+    "uuid": "^9.0.0"
   }
 }
