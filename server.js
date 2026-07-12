@@ -85,6 +85,14 @@ function getClientIp(req) {
   return (req.headers["x-forwarded-for"] || req.socket.remoteAddress || "").split(",")[0].trim();
 }
 
+// Extract licence key/id from URLs like /admin/licences/:id/action
+function extractIdFromUrl(url) {
+  const parts = url.split("/").filter(Boolean);
+  // URL pattern: /admin/licences/:id/action OR /api/admin/licences/:id/action
+  // The id is always 2 segments before the end (before the action)
+  return parts[parts.length - 2];
+}
+
 const server = http.createServer(async (req, res) => {
   if (req.method === "OPTIONS") {
     res.writeHead(204, {
@@ -144,38 +152,67 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // ── PATCH /api/admin/licences/:id/revoke ─────────────────────────────────────
+  // ── PATCH /admin/licences/:id/revoke ─────────────────────────────────────────
   if (req.method === "PATCH" && url.includes("/revoke")) {
-    const id = url.split("/").filter(Boolean).pop();
+    const id = extractIdFromUrl(url);
     try {
-      await pool.query(`UPDATE licences SET status = 'revoked' WHERE id = $1 OR license_key = $1`, [id]);
+      const result = await pool.query(`UPDATE licences SET status = 'revoked', active = FALSE WHERE id = $1 OR license_key = $1`, [id]);
+      console.log(`[REVOKE] id=${id} rows=${result.rowCount}`);
       return json(res, 200, { ok: true });
     } catch (err) { return json(res, 500, { ok: false, error: err.message }); }
   }
 
-  // ── PATCH /api/admin/licences/:id/reset-machine ──────────────────────────────
+  // ── PATCH /admin/licences/:id/reset-machine ──────────────────────────────────
   if (req.method === "PATCH" && url.includes("/reset-machine")) {
-    const id = url.split("/").filter(Boolean).pop();
+    const id = extractIdFromUrl(url);
     try {
-      await pool.query(`UPDATE licences SET machine_id = NULL WHERE id = $1 OR license_key = $1`, [id]);
+      const result = await pool.query(`UPDATE licences SET machine_id = NULL, status = 'pending', blocked = FALSE, suspicious = FALSE, suspicious_reason = NULL, known_devices = '[]' WHERE id = $1 OR license_key = $1`, [id]);
+      console.log(`[RESET-MACHINE] id=${id} rows=${result.rowCount}`);
       return json(res, 200, { ok: true });
     } catch (err) { return json(res, 500, { ok: false, error: err.message }); }
   }
 
-  // ── PATCH /api/admin/licences/:id/reactivate ─────────────────────────────────
+  // ── PATCH /admin/licences/:id/reactivate ─────────────────────────────────────
   if (req.method === "PATCH" && url.includes("/reactivate")) {
-    const id = url.split("/").filter(Boolean).pop();
+    const id = extractIdFromUrl(url);
     try {
-      await pool.query(`UPDATE licences SET status = 'active', deactivated = FALSE WHERE id = $1 OR license_key = $1`, [id]);
+      const result = await pool.query(`UPDATE licences SET status = CASE WHEN machine_id IS NOT NULL THEN 'active' ELSE 'pending' END, active = TRUE, deactivated = FALSE WHERE id = $1 OR license_key = $1`, [id]);
+      console.log(`[REACTIVATE] id=${id} rows=${result.rowCount}`);
       return json(res, 200, { ok: true });
     } catch (err) { return json(res, 500, { ok: false, error: err.message }); }
   }
 
-  // ── PATCH /api/admin/licences/:id/deactivate ─────────────────────────────────
+  // ── PATCH /admin/licences/:id/deactivate ───────────────────────────────────
   if (req.method === "PATCH" && url.includes("/deactivate")) {
-    const id = url.split("/").filter(Boolean).pop();
+    const id = extractIdFromUrl(url);
     try {
-      await pool.query(`UPDATE licences SET status = 'inactive', deactivated = TRUE WHERE id = $1 OR license_key = $1`, [id]);
+      const result = await pool.query(`UPDATE licences SET status = 'deactivated', deactivated = TRUE, machine_id = NULL WHERE id = $1 OR license_key = $1`, [id]);
+      console.log(`[DEACTIVATE] id=${id} rows=${result.rowCount}`);
+      return json(res, 200, { ok: true });
+    } catch (err) { return json(res, 500, { ok: false, error: err.message }); }
+  }
+
+  // ── PATCH /admin/licences/:id/clear-block ──────────────────────────────────
+  if (req.method === "PATCH" && url.includes("/clear-block")) {
+    const id = extractIdFromUrl(url);
+    try {
+      const result = await pool.query(`UPDATE licences SET blocked = FALSE, suspicious = FALSE, suspicious_reason = NULL WHERE id = $1 OR license_key = $1`, [id]);
+      console.log(`[CLEAR-BLOCK] id=${id} rows=${result.rowCount}`);
+      return json(res, 200, { ok: true });
+    } catch (err) { return json(res, 500, { ok: false, error: err.message }); }
+  }
+
+  // ── PATCH /admin/licences/:id/extend ───────────────────────────────────────
+  if (req.method === "PATCH" && url.includes("/extend")) {
+    const id = extractIdFromUrl(url);
+    const body = await readBody(req);
+    const days = parseInt(body.days) || 30;
+    try {
+      const result = await pool.query(
+        `UPDATE licences SET expires_at = GREATEST(expires_at, NOW()) + ($1 || ' days')::INTERVAL, duration = duration + $1 WHERE id = $2 OR license_key = $2`,
+        [days, id]
+      );
+      console.log(`[EXTEND] id=${id} days=${days} rows=${result.rowCount}`);
       return json(res, 200, { ok: true });
     } catch (err) { return json(res, 500, { ok: false, error: err.message }); }
   }
@@ -235,7 +272,7 @@ const server = http.createServer(async (req, res) => {
 
       const licence = rows[0];
 
-      if (licence.deactivated || licence.status === "revoked")
+      if (licence.deactivated || licence.status === "revoked" || licence.status === "deactivated")
         return json(res, 200, { ok: false, reason: "revoked" });
 
       if (licence.blocked)
@@ -300,12 +337,12 @@ const server = http.createServer(async (req, res) => {
 
       if (!rows.length) return json(res, 200, { ok: false, reason: "invalid_session" });
       const l = rows[0];
-      if (l.deactivated || l.status === "revoked") return json(res, 200, { ok: false, reason: "revoked" });
+      if (l.deactivated || l.status === "revoked" || l.status === "deactivated") return json(res, 200, { ok: false, reason: "revoked" });
       if (l.blocked) return json(res, 200, { ok: false, reason: "machine_blocked" });
       if (l.status !== "active") return json(res, 200, { ok: false, reason: "licence_inactive" });
       if (l.expires_at && new Date() > new Date(l.expires_at)) return json(res, 200, { ok: false, reason: "licence_expired" });
 
-      return json(res, 200, { ok: true });
+      return json(res, 200, { ok: true, expiresAt: l.expires_at });
     } catch {
       return json(res, 200, { ok: false, reason: "invalid_token" });
     }
@@ -333,7 +370,7 @@ const server = http.createServer(async (req, res) => {
 
       if (!rows.length) return json(res, 200, { ok: false, reason: "not_found" });
       const l = rows[0];
-      if (l.deactivated || l.status === "revoked") return json(res, 200, { ok: false, reason: "revoked" });
+      if (l.deactivated || l.status === "revoked" || l.status === "deactivated") return json(res, 200, { ok: false, reason: "revoked" });
       if (l.status !== "active") return json(res, 200, { ok: false, reason: "licence_inactive" });
       if (l.expires_at && new Date() > new Date(l.expires_at)) return json(res, 200, { ok: false, reason: "licence_expired" });
 
@@ -356,7 +393,7 @@ const server = http.createServer(async (req, res) => {
     const key  = (body.key || "").trim().toUpperCase();
     if (!key) return json(res, 400, { ok: false, error: "Missing key" });
     try {
-      await pool.query(`UPDATE licences SET status = 'revoked' WHERE license_key = $1`, [key]);
+      await pool.query(`UPDATE licences SET status = 'revoked', active = FALSE WHERE license_key = $1`, [key]);
       return json(res, 200, { ok: true });
     } catch (err) { return json(res, 500, { ok: false, error: "DB error" }); }
   }
@@ -384,7 +421,7 @@ const server = http.createServer(async (req, res) => {
 
       if (!rows.length) return json(res, 200, { ok: false, reason: "invalid" });
       const l = rows[0];
-      if (l.deactivated || l.status === "revoked") return json(res, 200, { ok: false, reason: "revoked" });
+      if (l.deactivated || l.status === "revoked" || l.status === "deactivated") return json(res, 200, { ok: false, reason: "revoked" });
       if (l.blocked) return json(res, 200, { ok: false, reason: "machine_blocked" });
       if (l.status !== "active") return json(res, 200, { ok: false, reason: "licence_inactive" });
       if (l.expires_at && new Date() > new Date(l.expires_at)) return json(res, 200, { ok: false, reason: "licence_expired" });
@@ -406,7 +443,7 @@ const server = http.createServer(async (req, res) => {
         [ip, version, JSON.stringify([hbEntry]), decoded.license_key]
       );
 
-      return json(res, 200, { ok: true });
+      return json(res, 200, { ok: true, expiresAt: l.expires_at });
     } catch {
       return json(res, 200, { ok: false, reason: "invalid_token" });
     }
