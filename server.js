@@ -88,9 +88,57 @@ function getClientIp(req) {
 // Extract licence key/id from URLs like /admin/licences/:id/action
 function extractIdFromUrl(url) {
   const parts = url.split("/").filter(Boolean);
-  // URL pattern: /admin/licences/:id/action OR /api/admin/licences/:id/action
-  // The id is always 2 segments before the end (before the action)
   return parts[parts.length - 2];
+}
+
+// Map DB row to dual-format response (snake_case + camelCase)
+function mapRow(r) {
+  if (!r) return null;
+  return {
+    id: r.id,
+    key: r.license_key,
+    licenseKey: r.license_key,
+    licenceKey: r.license_key,
+    license_key: r.license_key,
+    username: r.username || '',
+    machineId: r.machine_id,
+    machine_id: r.machine_id,
+    status: r.status,
+    active: r.active,
+    plan: r.plan,
+    notes: r.notes || '',
+    duration: r.duration,
+    expiresAt: r.expires_at,
+    expires_at: r.expires_at,
+    createdAt: r.created_at,
+    created_at: r.created_at,
+    activatedAt: r.activated_at,
+    activated_at: r.activated_at,
+    lastSeen: r.last_seen,
+    last_seen: r.last_seen,
+    firstIp: r.first_ip,
+    first_ip: r.first_ip,
+    lastIp: r.last_ip,
+    last_ip: r.last_ip,
+    currentVersion: r.current_version,
+    current_version: r.current_version,
+    browserInfo: r.browser_info,
+    browser_info: r.browser_info,
+    deactivated: r.deactivated || false,
+    blocked: r.blocked || false,
+    suspicious: r.suspicious || false,
+    suspiciousReason: r.suspicious_reason,
+    suspicious_reason: r.suspicious_reason,
+    knownDevices: r.known_devices || [],
+    known_devices: r.known_devices || [],
+    heartbeatHistory: r.heartbeat_history || [],
+    heartbeat_history: r.heartbeat_history || [],
+    activationHistory: r.activation_history || [],
+    activation_history: r.activation_history || [],
+    sessions: r.sessions || [],
+    bookingEvents: r.booking_events || [],
+    booking_events: r.booking_events || [],
+  };
 }
 
 const server = http.createServer(async (req, res) => {
@@ -117,7 +165,7 @@ const server = http.createServer(async (req, res) => {
     return json(res, 200, { ok: true, counts: { mlt: 0, aut: 0 } });
   }
 
-  // ── POST /admin/licences/generate OR /api/admin/licences/generate ────────────
+  // ── POST /admin/licences/generate ─────────────────────────────────────────
   if (req.method === "POST" && (url === "/api/admin/licences/generate" || url === "/admin/licences/generate")) {
     const body     = await readBody(req);
     const duration = parseInt(body.duration_days || body.duration) || 30;
@@ -128,31 +176,30 @@ const server = http.createServer(async (req, res) => {
     const expiresAt = new Date();
     expiresAt.setDate(expiresAt.getDate() + duration);
     try {
-      await pool.query(
-        `INSERT INTO licences (id, license_key, username, plan, status, duration, expires_at) VALUES ($1, $2, $3, $4, 'pending', $5, $6)`,
+      const { rows } = await pool.query(
+        `INSERT INTO licences (id, license_key, username, plan, status, duration, expires_at) VALUES ($1, $2, $3, $4, 'pending', $5, $6) RETURNING *`,
         [id, key, username, plan, duration, expiresAt]
       );
       console.log(`[GENERATE] key=${key}`);
-      const licenceObj = { id, license_key: key, username, plan, status: "pending", duration, expires_at: expiresAt };
-      return json(res, 200, { ok: true, key, license_key: key, id, duration_days: duration, licences: [licenceObj] });
+      return json(res, 200, { ok: true, key, license_key: key, id, duration_days: duration, licences: [mapRow(rows[0])] });
     } catch (err) {
       console.error("[GENERATE] error:", err.message);
       return json(res, 500, { ok: false, error: err.message });
     }
   }
 
-  // ── GET /api/admin/licences ───────────────────────────────────────────────────
+  // ── GET /admin/licences (list) ────────────────────────────────────────────
   if (req.method === "GET" && (url === "/api/admin/licences" || url === "/admin/licences")) {
     try {
-      const { rows } = await pool.query(`SELECT *, license_key AS licence_key, license_key AS "licenceKey", license_key AS key FROM licences ORDER BY created_at DESC LIMIT 100`);
-      const total = rows.length;
-      return json(res, 200, { data: rows, licences: rows, total, page: 1, limit: 100, totalPages: 1 });
+      const { rows } = await pool.query(`SELECT * FROM licences ORDER BY created_at DESC LIMIT 100`);
+      const mapped = rows.map(mapRow);
+      return json(res, 200, { data: mapped, licences: mapped, total: mapped.length, page: 1, limit: 100, totalPages: 1 });
     } catch (err) {
       return json(res, 500, { ok: false, error: err.message });
     }
   }
 
-  // ── PATCH /admin/licences/:id/revoke ─────────────────────────────────────────
+  // ── PATCH /admin/licences/:id/revoke ──────────────────────────────────────
   if (req.method === "PATCH" && url.includes("/revoke")) {
     const id = extractIdFromUrl(url);
     try {
@@ -162,7 +209,7 @@ const server = http.createServer(async (req, res) => {
     } catch (err) { return json(res, 500, { ok: false, error: err.message }); }
   }
 
-  // ── PATCH /admin/licences/:id/reset-machine ──────────────────────────────────
+  // ── PATCH /admin/licences/:id/reset-machine ───────────────────────────────
   if (req.method === "PATCH" && url.includes("/reset-machine")) {
     const id = extractIdFromUrl(url);
     try {
@@ -172,7 +219,7 @@ const server = http.createServer(async (req, res) => {
     } catch (err) { return json(res, 500, { ok: false, error: err.message }); }
   }
 
-  // ── PATCH /admin/licences/:id/reactivate ─────────────────────────────────────
+  // ── PATCH /admin/licences/:id/reactivate ──────────────────────────────────
   if (req.method === "PATCH" && url.includes("/reactivate")) {
     const id = extractIdFromUrl(url);
     try {
@@ -182,7 +229,7 @@ const server = http.createServer(async (req, res) => {
     } catch (err) { return json(res, 500, { ok: false, error: err.message }); }
   }
 
-  // ── PATCH /admin/licences/:id/deactivate ───────────────────────────────────
+  // ── PATCH /admin/licences/:id/deactivate ──────────────────────────────────
   if (req.method === "PATCH" && url.includes("/deactivate")) {
     const id = extractIdFromUrl(url);
     try {
@@ -192,7 +239,7 @@ const server = http.createServer(async (req, res) => {
     } catch (err) { return json(res, 500, { ok: false, error: err.message }); }
   }
 
-  // ── PATCH /admin/licences/:id/clear-block ──────────────────────────────────
+  // ── PATCH /admin/licences/:id/clear-block ─────────────────────────────────
   if (req.method === "PATCH" && url.includes("/clear-block")) {
     const id = extractIdFromUrl(url);
     try {
@@ -202,7 +249,7 @@ const server = http.createServer(async (req, res) => {
     } catch (err) { return json(res, 500, { ok: false, error: err.message }); }
   }
 
-  // ── PATCH /admin/licences/:id/extend ───────────────────────────────────────
+  // ── PATCH /admin/licences/:id/extend ──────────────────────────────────────
   if (req.method === "PATCH" && url.includes("/extend")) {
     const id = extractIdFromUrl(url);
     const body = await readBody(req);
@@ -217,19 +264,19 @@ const server = http.createServer(async (req, res) => {
     } catch (err) { return json(res, 500, { ok: false, error: err.message }); }
   }
 
-  // ── GET /admin/licences/:id ───────────────────────────────────────────────────
+  // ── GET /admin/licences/:id (detail) ──────────────────────────────────────
   if (req.method === "GET" && (url.match(/\/api\/admin\/licences\/.+/) || url.match(/\/admin\/licences\/.+/))) {
     const id = url.split("/").pop();
     try {
-      const { rows } = await pool.query(`SELECT *, license_key AS licence_key, license_key AS "licenceKey", license_key AS key FROM licences WHERE id = $1 OR license_key = $1`, [id]);
+      const { rows } = await pool.query(`SELECT * FROM licences WHERE id = $1 OR license_key = $1`, [id]);
       if (!rows.length) return json(res, 404, { ok: false, error: "Licence not found" });
-      return json(res, 200, { ok: true, licence: rows[0], ...rows[0] });
+      return json(res, 200, mapRow(rows[0]));
     } catch (err) {
       return json(res, 500, { ok: false, error: err.message });
     }
   }
 
-  // ── DELETE /admin/licences/:id ────────────────────────────────────────────────
+  // ── DELETE /admin/licences/:id ────────────────────────────────────────────
   if (req.method === "DELETE" && (url.startsWith("/api/admin/licences/") || url.startsWith("/admin/licences/"))) {
     const id = url.split("/").filter(Boolean).pop();
     try {
@@ -238,7 +285,7 @@ const server = http.createServer(async (req, res) => {
     } catch (err) { return json(res, 500, { ok: false, error: err.message }); }
   }
 
-  // ── POST /generate-licence (legacy) ──────────────────────────────────────────
+  // ── POST /generate-licence (legacy) ───────────────────────────────────────
   if (req.method === "POST" && url === "/generate-licence") {
     const body     = await readBody(req);
     const duration = parseInt(body.duration_days) || 30;
@@ -257,7 +304,7 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // ── POST /activate-licence ────────────────────────────────────────────────────
+  // ── POST /activate-licence ────────────────────────────────────────────────
   if (req.method === "POST" && url === "/activate-licence") {
     const body       = await readBody(req);
     const key        = (body.key || "").trim().toUpperCase();
@@ -317,7 +364,7 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // ── POST /validate-licence ────────────────────────────────────────────────────
+  // ── POST /validate-licence ────────────────────────────────────────────────
   if (req.method === "POST" && url === "/validate-licence") {
     const body  = await readBody(req);
     const token = (body.token || "").trim();
@@ -348,7 +395,7 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // ── POST /refresh-token ───────────────────────────────────────────────────────
+  // ── POST /refresh-token ───────────────────────────────────────────────────
   if (req.method === "POST" && url === "/refresh-token") {
     const body       = await readBody(req);
     const token      = (body.token      || "").trim();
@@ -387,7 +434,7 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // ── POST /revoke-licence ──────────────────────────────────────────────────────
+  // ── POST /revoke-licence ──────────────────────────────────────────────────
   if (req.method === "POST" && url === "/revoke-licence") {
     const body = await readBody(req);
     const key  = (body.key || "").trim().toUpperCase();
@@ -398,7 +445,7 @@ const server = http.createServer(async (req, res) => {
     } catch (err) { return json(res, 500, { ok: false, error: "DB error" }); }
   }
 
-  // ── POST /heartbeat ───────────────────────────────────────────────────────────
+  // ── POST /heartbeat ──────────────────────────────────────────────────────
   if (req.method === "POST" && url === "/heartbeat") {
     const body       = await readBody(req);
     const token      = (body.token      || "").trim();
