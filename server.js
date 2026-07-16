@@ -1,6 +1,6 @@
 /**
- * SlotHawk Licence Server v7.2
- * Devices + Sessions tracking
+ * SlotHawk Licence Server v7.3
+ * Auto-revoke duplicate machine + devices/sessions tracking
  */
 
 require("dotenv").config();
@@ -13,7 +13,7 @@ const { v4: uuidv4 } = require("uuid");
 const PORT        = parseInt(process.env.PORT) || 8765;
 const JWT_SECRET  = process.env.JWT_SECRET;
 const JWT_EXPIRES = process.env.JWT_EXPIRES_IN || "7d";
-const SESSION_GAP = 10 * 60 * 1000; // 10 min
+const SESSION_GAP = 10 * 60 * 1000;
 
 if (!JWT_SECRET) { console.error("FATAL: JWT_SECRET missing"); process.exit(1); }
 
@@ -131,7 +131,7 @@ const server = http.createServer(async (req, res) => {
   const url = req.url.split("?")[0];
 
   if (req.method === "GET" && url === "/health") {
-    return json(res, 200, { status: "ok", version: "7.2.0", requiredExtensionVersion: process.env.REQUIRED_VERSION || "0.2.10" });
+    return json(res, 200, { status: "ok", version: "7.3.0", requiredExtensionVersion: process.env.REQUIRED_VERSION || "0.2.10" });
   }
   if (req.method === "GET" && url === "/version") {
     return json(res, 200, { required: process.env.REQUIRED_VERSION || "0.2.10" });
@@ -198,7 +198,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "PATCH" && url.includes("/reactivate")) {
     const id = extractIdFromUrl(url);
     try {
-      const result = await pool.query(`UPDATE licences SET status = CASE WHEN machine_id IS NOT NULL THEN 'active' ELSE 'pending' END, active = TRUE, deactivated = FALSE WHERE id = $1 OR license_key = $1`, [id]);
+      const result = await pool.query(`UPDATE licences SET status = CASE WHEN machine_id IS NOT NULL THEN 'active' ELSE 'pending' END, active = TRUE, deactivated = FALSE, blocked = FALSE, suspicious = FALSE, suspicious_reason = NULL WHERE id = $1 OR license_key = $1`, [id]);
       console.log(`[REACTIVATE] id=${id} rows=${result.rowCount}`);
       return json(res, 200, { ok: true });
     } catch (err) { return json(res, 500, { ok: false, error: err.message }); }
@@ -300,20 +300,31 @@ const server = http.createServer(async (req, res) => {
         return json(res, 200, { ok: false, reason: "machine_blocked" });
       if (licence.expires_at && new Date() > new Date(licence.expires_at))
         return json(res, 200, { ok: false, reason: "expired" });
-      if (licence.machine_id && machine_id && licence.machine_id !== machine_id)
-        return json(res, 200, { ok: false, reason: "machine_blocked" });
+
+      // ── DUPLICATE MACHINE → AUTO-REVOKE ALL ───────────────────────
+      if (licence.machine_id && machine_id && licence.machine_id !== machine_id) {
+        await pool.query(
+          `UPDATE licences SET
+            status = 'revoked', active = FALSE, blocked = TRUE,
+            suspicious = TRUE, suspicious_reason = $1
+           WHERE license_key = $2`,
+          [`Auto-revoked: duplicate machine attempt. Original: ${licence.machine_id}, Attacker: ${machine_id}, IP: ${ip}`, key]
+        );
+        console.log(`[AUTO-REVOKE] key=${key} original=${licence.machine_id} attacker=${machine_id} ip=${ip}`);
+        return json(res, 200, { ok: false, reason: "revoked" });
+      }
 
       const now = new Date();
       const expiresAt = licence.expires_at || (() => { const d = new Date(now); d.setDate(d.getDate() + licence.duration); return d; })();
 
-      // ── Update known_devices ──────────────────────────────────────────
+      // ── Update known_devices ──────────────────────────────────────
       const devices = licence.known_devices || [];
       const alreadyKnown = devices.some(d => d.machineId === machine_id && d.ip === ip);
       if (!alreadyKnown && machine_id) {
         devices.push({ machineId: machine_id, ip: ip, firstSeenAt: now.toISOString() });
       }
 
-      // ── Update activation_history ─────────────────────────────────────
+      // ── Update activation_history ─────────────────────────────────
       const actHistory = licence.activation_history || [];
       actHistory.unshift({
         id: uuidv4(),
@@ -471,7 +482,6 @@ const server = http.createServer(async (req, res) => {
       const gap = lastSession ? (now - new Date(lastSession.lastPingAt)) : Infinity;
 
       if (gap > SESSION_GAP) {
-        // New session
         sessions.unshift({
           id: uuidv4(),
           startedAt: now.toISOString(),
@@ -482,7 +492,6 @@ const server = http.createServer(async (req, res) => {
         });
         if (sessions.length > 50) sessions.length = 50;
       } else {
-        // Update existing session
         sessions[0].lastPingAt = now.toISOString();
       }
 
