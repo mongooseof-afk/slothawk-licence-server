@@ -1,6 +1,6 @@
 /**
- * SlotHawk Licence Server v7
- * Compatible with migrate_v7.sql schema
+ * SlotHawk Licence Server v7.2
+ * Devices + Sessions tracking
  */
 
 require("dotenv").config();
@@ -13,6 +13,7 @@ const { v4: uuidv4 } = require("uuid");
 const PORT        = parseInt(process.env.PORT) || 8765;
 const JWT_SECRET  = process.env.JWT_SECRET;
 const JWT_EXPIRES = process.env.JWT_EXPIRES_IN || "7d";
+const SESSION_GAP = 10 * 60 * 1000; // 10 min
 
 if (!JWT_SECRET) { console.error("FATAL: JWT_SECRET missing"); process.exit(1); }
 
@@ -85,59 +86,35 @@ function getClientIp(req) {
   return (req.headers["x-forwarded-for"] || req.socket.remoteAddress || "").split(",")[0].trim();
 }
 
-// Extract licence key/id from URLs like /admin/licences/:id/action
 function extractIdFromUrl(url) {
   const parts = url.split("/").filter(Boolean);
   return parts[parts.length - 2];
 }
 
-// Map DB row to dual-format response (snake_case + camelCase)
 function mapRow(r) {
   if (!r) return null;
   return {
     id: r.id,
-    key: r.license_key,
-    licenseKey: r.license_key,
-    licenceKey: r.license_key,
-    license_key: r.license_key,
+    key: r.license_key, licenseKey: r.license_key, licenceKey: r.license_key, license_key: r.license_key,
     username: r.username || '',
-    machineId: r.machine_id,
-    machine_id: r.machine_id,
-    status: r.status,
-    active: r.active,
-    plan: r.plan,
-    notes: r.notes || '',
-    duration: r.duration,
-    expiresAt: r.expires_at,
-    expires_at: r.expires_at,
-    createdAt: r.created_at,
-    created_at: r.created_at,
-    activatedAt: r.activated_at,
-    activated_at: r.activated_at,
-    lastSeen: r.last_seen,
-    last_seen: r.last_seen,
-    firstIp: r.first_ip,
-    first_ip: r.first_ip,
-    lastIp: r.last_ip,
-    last_ip: r.last_ip,
-    currentVersion: r.current_version,
-    current_version: r.current_version,
-    browserInfo: r.browser_info,
-    browser_info: r.browser_info,
-    deactivated: r.deactivated || false,
-    blocked: r.blocked || false,
+    machineId: r.machine_id, machine_id: r.machine_id,
+    status: r.status, active: r.active, plan: r.plan, notes: r.notes || '', duration: r.duration,
+    expiresAt: r.expires_at, expires_at: r.expires_at,
+    createdAt: r.created_at, created_at: r.created_at,
+    activatedAt: r.activated_at, activated_at: r.activated_at,
+    lastSeen: r.last_seen, last_seen: r.last_seen,
+    firstIp: r.first_ip, first_ip: r.first_ip,
+    lastIp: r.last_ip, last_ip: r.last_ip,
+    currentVersion: r.current_version, current_version: r.current_version,
+    browserInfo: r.browser_info, browser_info: r.browser_info,
+    deactivated: r.deactivated || false, blocked: r.blocked || false,
     suspicious: r.suspicious || false,
-    suspiciousReason: r.suspicious_reason,
-    suspicious_reason: r.suspicious_reason,
-    knownDevices: r.known_devices || [],
-    known_devices: r.known_devices || [],
-    heartbeatHistory: r.heartbeat_history || [],
-    heartbeat_history: r.heartbeat_history || [],
-    activationHistory: r.activation_history || [],
-    activation_history: r.activation_history || [],
+    suspiciousReason: r.suspicious_reason, suspicious_reason: r.suspicious_reason,
+    knownDevices: r.known_devices || [], known_devices: r.known_devices || [],
+    heartbeatHistory: r.heartbeat_history || [], heartbeat_history: r.heartbeat_history || [],
+    activationHistory: r.activation_history || [], activation_history: r.activation_history || [],
     sessions: r.sessions || [],
-    bookingEvents: r.booking_events || [],
-    booking_events: r.booking_events || [],
+    bookingEvents: r.booking_events || [], booking_events: r.booking_events || [],
   };
 }
 
@@ -154,13 +131,11 @@ const server = http.createServer(async (req, res) => {
   const url = req.url.split("?")[0];
 
   if (req.method === "GET" && url === "/health") {
-    return json(res, 200, { status: "ok", version: "7.0.0", requiredExtensionVersion: process.env.REQUIRED_VERSION || "0.2.10" });
+    return json(res, 200, { status: "ok", version: "7.2.0", requiredExtensionVersion: process.env.REQUIRED_VERSION || "0.2.10" });
   }
-
   if (req.method === "GET" && url === "/version") {
     return json(res, 200, { required: process.env.REQUIRED_VERSION || "0.2.10" });
   }
-
   if (req.method === "GET" && url === "/status") {
     return json(res, 200, { ok: true, counts: { mlt: 0, aut: 0 } });
   }
@@ -321,19 +296,33 @@ const server = http.createServer(async (req, res) => {
 
       if (licence.deactivated || licence.status === "revoked" || licence.status === "deactivated")
         return json(res, 200, { ok: false, reason: "revoked" });
-
       if (licence.blocked)
         return json(res, 200, { ok: false, reason: "machine_blocked" });
-
       if (licence.expires_at && new Date() > new Date(licence.expires_at))
         return json(res, 200, { ok: false, reason: "expired" });
-
       if (licence.machine_id && machine_id && licence.machine_id !== machine_id)
         return json(res, 200, { ok: false, reason: "machine_blocked" });
 
       const now = new Date();
       const expiresAt = licence.expires_at || (() => { const d = new Date(now); d.setDate(d.getDate() + licence.duration); return d; })();
-      const activationEntry = { machine_id, ip, activated_at: now.toISOString() };
+
+      // ── Update known_devices ──────────────────────────────────────────
+      const devices = licence.known_devices || [];
+      const alreadyKnown = devices.some(d => d.machineId === machine_id && d.ip === ip);
+      if (!alreadyKnown && machine_id) {
+        devices.push({ machineId: machine_id, ip: ip, firstSeenAt: now.toISOString() });
+      }
+
+      // ── Update activation_history ─────────────────────────────────────
+      const actHistory = licence.activation_history || [];
+      actHistory.unshift({
+        id: uuidv4(),
+        machineId: machine_id,
+        ip: ip,
+        version: (body.browser_info || {}).extension_version || '',
+        createdAt: now.toISOString(),
+      });
+      if (actHistory.length > 20) actHistory.length = 20;
 
       await pool.query(
         `UPDATE licences SET
@@ -344,9 +333,10 @@ const server = http.createServer(async (req, res) => {
           last_seen = $4,
           first_ip = COALESCE(first_ip, $5),
           last_ip = $5,
-          activation_history = activation_history || $6::jsonb
-         WHERE license_key = $7`,
-        [machine_id || null, now, expiresAt, now, ip, JSON.stringify([activationEntry]), key]
+          known_devices = $6,
+          activation_history = $7
+         WHERE license_key = $8`,
+        [machine_id || null, now, expiresAt, now, ip, JSON.stringify(devices), JSON.stringify(actHistory), key]
       );
 
       const token = jwt.sign(
@@ -355,7 +345,7 @@ const server = http.createServer(async (req, res) => {
         { expiresIn: JWT_EXPIRES }
       );
 
-      console.log(`[ACTIVATE] OK key=${key}`);
+      console.log(`[ACTIVATE] OK key=${key} machine=${machine_id}`);
       return json(res, 200, { ok: true, token, expiresAt: expiresAt instanceof Date ? expiresAt.toISOString() : expiresAt });
 
     } catch (err) {
@@ -445,7 +435,7 @@ const server = http.createServer(async (req, res) => {
     } catch (err) { return json(res, 500, { ok: false, error: "DB error" }); }
   }
 
-  // ── POST /heartbeat ──────────────────────────────────────────────────────
+  // ── POST /heartbeat ───────────────────────────────────────────────────────
   if (req.method === "POST" && url === "/heartbeat") {
     const body       = await readBody(req);
     const token      = (body.token      || "").trim();
@@ -462,35 +452,63 @@ const server = http.createServer(async (req, res) => {
         return json(res, 200, { ok: false, reason: "machine_blocked" });
 
       const { rows } = await pool.query(
-        `SELECT status, expires_at, deactivated, blocked FROM licences WHERE license_key = $1`,
+        `SELECT * FROM licences WHERE license_key = $1`,
         [decoded.license_key]
       );
 
       if (!rows.length) return json(res, 200, { ok: false, reason: "invalid" });
-      const l = rows[0];
-      if (l.deactivated || l.status === "revoked" || l.status === "deactivated") return json(res, 200, { ok: false, reason: "revoked" });
-      if (l.blocked) return json(res, 200, { ok: false, reason: "machine_blocked" });
-      if (l.status !== "active") return json(res, 200, { ok: false, reason: "licence_inactive" });
-      if (l.expires_at && new Date() > new Date(l.expires_at)) return json(res, 200, { ok: false, reason: "licence_expired" });
+      const licence = rows[0];
+      if (licence.deactivated || licence.status === "revoked" || licence.status === "deactivated") return json(res, 200, { ok: false, reason: "revoked" });
+      if (licence.blocked) return json(res, 200, { ok: false, reason: "machine_blocked" });
+      if (licence.status !== "active") return json(res, 200, { ok: false, reason: "licence_inactive" });
+      if (licence.expires_at && new Date() > new Date(licence.expires_at)) return json(res, 200, { ok: false, reason: "licence_expired" });
 
-      const hbEntry = { ts: new Date().toISOString(), ip, version };
+      const now = new Date();
+
+      // ── Update sessions ─────────────────────────────────────────────
+      const sessions = licence.sessions || [];
+      const lastSession = sessions[0];
+      const gap = lastSession ? (now - new Date(lastSession.lastPingAt)) : Infinity;
+
+      if (gap > SESSION_GAP) {
+        // New session
+        sessions.unshift({
+          id: uuidv4(),
+          startedAt: now.toISOString(),
+          lastPingAt: now.toISOString(),
+          endedAt: null,
+          ip: ip,
+          machineId: machine_id,
+        });
+        if (sessions.length > 50) sessions.length = 50;
+      } else {
+        // Update existing session
+        sessions[0].lastPingAt = now.toISOString();
+      }
+
+      // ── Update heartbeat_history ────────────────────────────────────
+      const hbHistory = licence.heartbeat_history || [];
+      hbHistory.unshift({
+        id: uuidv4(),
+        createdAt: now.toISOString(),
+        ip: ip,
+        version: version,
+        machineId: machine_id,
+      });
+      if (hbHistory.length > 50) hbHistory.length = 50;
 
       await pool.query(
         `UPDATE licences SET
-          last_seen = NOW(),
-          last_ip = $1,
-          current_version = $2,
-          heartbeat_history = (
-            SELECT jsonb_agg(val) FROM (
-              SELECT val FROM jsonb_array_elements(heartbeat_history || $3::jsonb) val
-              ORDER BY (val->>'ts') DESC LIMIT 50
-            ) sub
-          )
-         WHERE license_key = $4`,
-        [ip, version, JSON.stringify([hbEntry]), decoded.license_key]
+          last_seen = $1,
+          last_ip = $2,
+          current_version = $3,
+          sessions = $4,
+          heartbeat_history = $5
+         WHERE license_key = $6`,
+        [now, ip, version, JSON.stringify(sessions), JSON.stringify(hbHistory), decoded.license_key]
       );
 
-      return json(res, 200, { ok: true, expiresAt: l.expires_at });
+      return json(res, 200, { ok: true, expiresAt: licence.expires_at });
     } catch {
       return json(res, 200, { ok: false, reason: "invalid_token" });
     }
