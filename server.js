@@ -231,7 +231,7 @@ const server = http.createServer(async (req, res) => {
     const days = parseInt(body.days) || 30;
     try {
       const result = await pool.query(
-        `UPDATE licences SET expires_at = GREATEST(expires_at, NOW()) + ($1 || ' days')::INTERVAL, duration = duration + $1 WHERE id = $2 OR license_key = $2`,
+        `UPDATE licences SET expires_at = GREATEST(expires_at, NOW()) + ($1 * INTERVAL '1 day'), duration = duration + $1 WHERE id = $2 OR license_key = $2`,
         [days, id]
       );
       console.log(`[EXTEND] id=${id} days=${days} rows=${result.rowCount}`);
@@ -317,14 +317,12 @@ const server = http.createServer(async (req, res) => {
       const now = new Date();
       const expiresAt = licence.expires_at || (() => { const d = new Date(now); d.setDate(d.getDate() + licence.duration); return d; })();
 
-      // ── Update known_devices ──────────────────────────────────────
       const devices = licence.known_devices || [];
       const alreadyKnown = devices.some(d => d.machineId === machine_id && d.ip === ip);
       if (!alreadyKnown && machine_id) {
         devices.push({ machineId: machine_id, ip: ip, firstSeenAt: now.toISOString() });
       }
 
-      // ── Update activation_history ─────────────────────────────────
       const actHistory = licence.activation_history || [];
       actHistory.unshift({
         id: uuidv4(),
@@ -462,10 +460,7 @@ const server = http.createServer(async (req, res) => {
       if (decoded.machine_id && machine_id && decoded.machine_id !== machine_id)
         return json(res, 200, { ok: false, reason: "machine_blocked" });
 
-      const { rows } = await pool.query(
-        `SELECT * FROM licences WHERE license_key = $1`,
-        [decoded.license_key]
-      );
+      const { rows } = await pool.query(`SELECT * FROM licences WHERE license_key = $1`, [decoded.license_key]);
 
       if (!rows.length) return json(res, 200, { ok: false, reason: "invalid" });
       const licence = rows[0];
@@ -476,7 +471,6 @@ const server = http.createServer(async (req, res) => {
 
       const now = new Date();
 
-      // ── Update sessions ─────────────────────────────────────────────
       const sessions = licence.sessions || [];
       const lastSession = sessions[0];
       const gap = lastSession ? (now - new Date(lastSession.lastPingAt)) : Infinity;
@@ -495,7 +489,6 @@ const server = http.createServer(async (req, res) => {
         sessions[0].lastPingAt = now.toISOString();
       }
 
-      // ── Update heartbeat_history ────────────────────────────────────
       const hbHistory = licence.heartbeat_history || [];
       hbHistory.unshift({
         id: uuidv4(),
