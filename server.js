@@ -231,7 +231,7 @@ const server = http.createServer(async (req, res) => {
     const days = parseInt(body.days) || 30;
     try {
       const result = await pool.query(
-        `UPDATE licences SET expires_at = GREATEST(expires_at, NOW()) + ($1::text || ' days')::INTERVAL, duration = duration + $1 WHERE id = $2 OR license_key = $2`,
+        `UPDATE licences SET expires_at = GREATEST(expires_at, NOW()) + ($1 || ' days')::INTERVAL, duration = duration + $1 WHERE id = $2 OR license_key = $2`,
         [days, id]
       );
       console.log(`[EXTEND] id=${id} days=${days} rows=${result.rowCount}`);
