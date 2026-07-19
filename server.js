@@ -15,6 +15,46 @@ const JWT_SECRET  = process.env.JWT_SECRET;
 const JWT_EXPIRES = process.env.JWT_EXPIRES_IN || "7d";
 const SESSION_GAP = 10 * 60 * 1000;
 
+// ── Telegram alert config ────────────────────────────────────────────
+// Extension no longer holds the bot token — it POSTs to /alert/telegram
+// with a JWT, and this server verifies + forwards to Telegram.
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
+const TELEGRAM_CHAT_ID   = process.env.TELEGRAM_CHAT_ID   || "";
+const TELEGRAM_ENABLED   = !!(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID);
+if (!TELEGRAM_ENABLED) {
+  console.warn("[TELEGRAM] Disabled — set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID env vars to enable alerts");
+}
+
+// Rate limit: max 20 alerts / minute per licence key (in-memory).
+// Resets on server restart — acceptable, since a fresh burst quota
+// after a redeploy is not exploitable.
+const ALERT_RATE_LIMIT      = 20;
+const ALERT_RATE_WINDOW_MS  = 60_000;
+const alertRateMap = new Map(); // license_key → [timestamps]
+
+function checkAlertRateLimit(key) {
+  const now = Date.now();
+  const arr = (alertRateMap.get(key) || []).filter(t => now - t < ALERT_RATE_WINDOW_MS);
+  if (arr.length >= ALERT_RATE_LIMIT) {
+    alertRateMap.set(key, arr);
+    return false;
+  }
+  arr.push(now);
+  alertRateMap.set(key, arr);
+  return true;
+}
+
+// Periodic cleanup so the Map doesn't grow unbounded over the process
+// lifetime. Runs every 5 minutes, drops entries with no recent hits.
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, arr] of alertRateMap.entries()) {
+    const filtered = arr.filter(t => now - t < ALERT_RATE_WINDOW_MS);
+    if (filtered.length === 0) alertRateMap.delete(key);
+    else alertRateMap.set(key, filtered);
+  }
+}, 5 * 60_000);
+
 if (!JWT_SECRET) { console.error("FATAL: JWT_SECRET missing"); process.exit(1); }
 
 const pool = process.env.DATABASE_URL
@@ -116,6 +156,51 @@ function mapRow(r) {
     sessions: r.sessions || [],
     bookingEvents: r.booking_events || [], booking_events: r.booking_events || [],
   };
+}
+
+// ── Telegram message builder ─────────────────────────────────────────
+// Moved server-side so the format can evolve without shipping a new
+// extension release. Extension only sends structured alert data; the
+// final rendered message is built here.
+//
+// IMPORTANT: the availability date is NEVER included in the alert. If a
+// subscriber could read the date from Telegram, they could book the
+// slot themselves without needing the extension, which defeats the
+// point of the subscription. Only country, category, and city ship out.
+function escapeMarkdownV2(text) {
+  return String(text).replace(/[_*[\]()~`>#+\-=|{}.!\\]/g, ch => `\\${ch}`);
+}
+
+function formatMoroccoTimestamp(date) {
+  // Morocco is UTC+1 during DST; shift so the printed time matches the
+  // subscriber's wall clock.
+  const shifted = new Date(date.getTime() + 60 * 60 * 1000);
+  const pad = n => String(n).padStart(2, "0");
+  return `${pad(shifted.getUTCHours())}:${pad(shifted.getUTCMinutes())}:${pad(shifted.getUTCSeconds())}`;
+}
+
+const MISSION_FLAGS = { Malta: "🇲🇹", Austria: "🇦🇹" };
+const CITY_NAMES = {
+  MLMCS: "Casablanca", MLMRBT: "Rabat", MLMTGR: "Tangier",
+  ASCA: "Casablanca", ASRB: "Rabat", TVC: "Tangier",
+};
+
+function buildSlotAlertMessage({ missionName, city, subcategory }) {
+  const flag     = MISSION_FLAGS[missionName] || "🌍";
+  const cityName = CITY_NAMES[city] || city || "Unknown";
+  const time     = formatMoroccoTimestamp(new Date());
+
+  return [
+    "🦅 *SLOTHAWK SPOTTED A SLOT* 🦅",
+    "▬▬▬▬▬▬▬▬▬▬▬▬▬▬",
+    `PAYS: ${escapeMarkdownV2(missionName)} ${flag}`,
+    `TYPE: ${escapeMarkdownV2(subcategory)}`,
+    `📍 ${escapeMarkdownV2(cityName)}`,
+    "",
+    `Spotted at ${escapeMarkdownV2(time)}`,
+    "",
+    "🛩️ *DIVE IN NOW*",
+  ].join("\n");
 }
 
 const server = http.createServer(async (req, res) => {
@@ -513,6 +598,97 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, expiresAt: licence.expires_at });
     } catch {
       return json(res, 200, { ok: false, reason: "invalid_token" });
+    }
+  }
+
+  // ── POST /alert/telegram ──────────────────────────────────────────────────
+  // Extension calls this instead of api.telegram.org directly, so the bot
+  // token stays server-side. JWT-authenticated, licence-status-checked,
+  // rate-limited (20/min per licence).
+  //
+  // Request body: { token: "<JWT>", alert: { missionName, city, subcategory } }
+  // The `earliestDate` field is intentionally NOT accepted here — if the
+  // extension ever sends it, we strip it before building the message.
+  if (req.method === "POST" && url === "/alert/telegram") {
+    if (!TELEGRAM_ENABLED) {
+      return json(res, 503, { ok: false, reason: "telegram_disabled" });
+    }
+
+    const body  = await readBody(req);
+    const token = (body.token || "").trim();
+    const alert = body.alert || {};
+
+    if (!token) return json(res, 401, { ok: false, reason: "missing_token" });
+    if (!alert.missionName || !alert.subcategory) {
+      return json(res, 400, { ok: false, reason: "missing_alert_data" });
+    }
+
+    // 1. Verify JWT
+    let decoded;
+    try { decoded = jwt.verify(token, JWT_SECRET); }
+    catch { return json(res, 401, { ok: false, reason: "invalid_token" }); }
+
+    const licenceKey = decoded.license_key;
+    if (!licenceKey) return json(res, 401, { ok: false, reason: "invalid_token" });
+
+    // 2. Check licence status (same rules as /heartbeat)
+    try {
+      const { rows } = await pool.query(
+        `SELECT status, expires_at, deactivated, blocked FROM licences WHERE license_key = $1`,
+        [licenceKey]
+      );
+      if (!rows.length) return json(res, 403, { ok: false, reason: "invalid_licence" });
+      const l = rows[0];
+      if (l.deactivated || l.status === "revoked" || l.status === "deactivated") {
+        return json(res, 403, { ok: false, reason: "revoked" });
+      }
+      if (l.blocked) return json(res, 403, { ok: false, reason: "machine_blocked" });
+      if (l.status !== "active") return json(res, 403, { ok: false, reason: "licence_inactive" });
+      if (l.expires_at && new Date() > new Date(l.expires_at)) {
+        return json(res, 403, { ok: false, reason: "licence_expired" });
+      }
+    } catch (err) {
+      console.error("[ALERT] DB error:", err.message);
+      return json(res, 500, { ok: false, reason: "db_error" });
+    }
+
+    // 3. Rate limit
+    if (!checkAlertRateLimit(licenceKey)) {
+      console.log(`[ALERT] Rate limit hit for ${licenceKey}`);
+      return json(res, 429, { ok: false, reason: "rate_limited" });
+    }
+
+    // 4. Build message + send to Telegram.
+    // Only country, category, city ship out. Date is deliberately omitted.
+    const message = buildSlotAlertMessage({
+      missionName: String(alert.missionName || ""),
+      city:        String(alert.city || ""),
+      subcategory: String(alert.subcategory || ""),
+    });
+
+    try {
+      const tgRes = await fetch(
+        `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            chat_id:    TELEGRAM_CHAT_ID,
+            text:       message,
+            parse_mode: "MarkdownV2",
+          }),
+        }
+      );
+      const data = await tgRes.json().catch(() => null);
+      if (!tgRes.ok || !data?.ok) {
+        console.error(`[ALERT] Telegram error for ${licenceKey}:`, data?.description);
+        return json(res, 502, { ok: false, reason: "telegram_error", detail: data?.description });
+      }
+      console.log(`[ALERT] Sent for ${licenceKey}: ${alert.missionName}/${alert.subcategory}/${alert.city}`);
+      return json(res, 200, { ok: true });
+    } catch (err) {
+      console.error("[ALERT] Fetch error:", err.message);
+      return json(res, 502, { ok: false, reason: "network_error" });
     }
   }
 
