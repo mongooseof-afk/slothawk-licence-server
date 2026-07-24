@@ -18,11 +18,24 @@ const SESSION_GAP = 10 * 60 * 1000;
 // ── Telegram alert config ────────────────────────────────────────────
 // Extension no longer holds the bot token — it POSTs to /alert/telegram
 // with a JWT, and this server verifies + forwards to Telegram.
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
-const TELEGRAM_CHAT_ID   = process.env.TELEGRAM_CHAT_ID   || "";
-const TELEGRAM_ENABLED   = !!(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID);
+const TELEGRAM_BOT_TOKEN     = process.env.TELEGRAM_BOT_TOKEN     || "";
+// Legacy channel — kept for existing subscribers who receive alerts on
+// a 10-minute delay so the Pro channel keeps a real head start.
+const TELEGRAM_CHAT_ID       = process.env.TELEGRAM_CHAT_ID       || "";
+// Pro channel — receives every alert immediately. Configured via env
+// so rotation doesn't need a code change. Same bot token as the legacy
+// channel: the bot just needs to be an admin in both chats.
+const TELEGRAM_PRO_CHAT_ID   = process.env.TELEGRAM_PRO_CHAT_ID   || "";
+// How long to wait before mirroring an alert into the legacy channel.
+// 10 min at the moment; env-configurable so tuning it doesn't require
+// a code change either.
+const TELEGRAM_LEGACY_DELAY_MS = Number(process.env.TELEGRAM_LEGACY_DELAY_MS || 10 * 60 * 1000);
+
+const TELEGRAM_ENABLED       = !!(TELEGRAM_BOT_TOKEN && (TELEGRAM_CHAT_ID || TELEGRAM_PRO_CHAT_ID));
 if (!TELEGRAM_ENABLED) {
-  console.warn("[TELEGRAM] Disabled — set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID env vars to enable alerts");
+  console.warn("[TELEGRAM] Disabled — set TELEGRAM_BOT_TOKEN and at least one of TELEGRAM_CHAT_ID / TELEGRAM_PRO_CHAT_ID env vars to enable alerts");
+} else {
+  console.log(`[TELEGRAM] Enabled — Pro=${TELEGRAM_PRO_CHAT_ID ? "set" : "unset"}, Legacy=${TELEGRAM_CHAT_ID ? "set" : "unset"}, LegacyDelay=${TELEGRAM_LEGACY_DELAY_MS}ms`);
 }
 
 // Rate limit: max 20 alerts / minute per licence key (in-memory).
@@ -201,6 +214,57 @@ function buildSlotAlertMessage({ missionName, city, subcategory }) {
     "",
     "🛩️ *DIVE IN NOW*",
   ].join("\n");
+}
+
+// Post a pre-built message to one Telegram chat. Returns {ok, error?}
+// so callers can decide whether to abort a request or continue with
+// other channels. Empty chatId is treated as a soft no-op so the same
+// call site works whether only one of Pro/Legacy is configured.
+async function sendTelegramToChat(chatId, message, contextLabel) {
+  if (!chatId) return { ok: false, error: "chat_id_not_configured" };
+  try {
+    const tgRes = await fetch(
+      `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          chat_id:    chatId,
+          text:       message,
+          parse_mode: "MarkdownV2",
+        }),
+      }
+    );
+    const data = await tgRes.json().catch(() => null);
+    if (!tgRes.ok || !data?.ok) {
+      const desc = data?.description || `HTTP ${tgRes.status}`;
+      console.error(`[TELEGRAM][${contextLabel}] Send failed to ${chatId}: ${desc}`);
+      return { ok: false, error: desc };
+    }
+    return { ok: true };
+  } catch (err) {
+    console.error(`[TELEGRAM][${contextLabel}] Fetch error for ${chatId}: ${err.message}`);
+    return { ok: false, error: err.message };
+  }
+}
+
+// Schedule a legacy-channel send after TELEGRAM_LEGACY_DELAY_MS. Uses
+// in-memory setTimeout (Q1 = A "Simple") — a redeploy or crash during
+// the 10-min window will drop the pending sends, which is accepted as
+// the cost of not maintaining a persistent queue. Errors are logged
+// only; they can't propagate back to the caller by then.
+function scheduleLegacyTelegramSend(message, licenceKey) {
+  if (!TELEGRAM_CHAT_ID) return;
+  setTimeout(async () => {
+    const result = await sendTelegramToChat(TELEGRAM_CHAT_ID, message, "LEGACY");
+    if (result.ok) {
+      console.log(`[ALERT] Delayed legacy send for ${licenceKey} succeeded (${TELEGRAM_LEGACY_DELAY_MS}ms after Pro)`);
+    }
+    // Errors already logged by sendTelegramToChat; nothing else we can
+    // do — the request that scheduled this returned long ago.
+  }, TELEGRAM_LEGACY_DELAY_MS).unref?.();
+  // unref() lets Node exit cleanly even if a pending timer is queued,
+  // which matters for graceful shutdown on Render redeploys.
 }
 
 const server = http.createServer(async (req, res) => {
@@ -658,7 +722,7 @@ const server = http.createServer(async (req, res) => {
       return json(res, 429, { ok: false, reason: "rate_limited" });
     }
 
-    // 4. Build message + send to Telegram.
+    // 4. Build message.
     // Only country, category, city ship out. Date is deliberately omitted.
     const message = buildSlotAlertMessage({
       missionName: String(alert.missionName || ""),
@@ -666,30 +730,42 @@ const server = http.createServer(async (req, res) => {
       subcategory: String(alert.subcategory || ""),
     });
 
-    try {
-      const tgRes = await fetch(
-        `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            chat_id:    TELEGRAM_CHAT_ID,
-            text:       message,
-            parse_mode: "MarkdownV2",
-          }),
-        }
-      );
-      const data = await tgRes.json().catch(() => null);
-      if (!tgRes.ok || !data?.ok) {
-        console.error(`[ALERT] Telegram error for ${licenceKey}:`, data?.description);
-        return json(res, 502, { ok: false, reason: "telegram_error", detail: data?.description });
+    // 5. Send to the Pro channel immediately. This is the request the
+    //    extension is waiting on — its success/failure is what we return.
+    //    The Legacy channel is scheduled separately (see step 6) and its
+    //    outcome doesn't affect this response (Q3 = B: one alert = one
+    //    rate-limit unit even though we mirror to two channels).
+    if (TELEGRAM_PRO_CHAT_ID) {
+      const proResult = await sendTelegramToChat(TELEGRAM_PRO_CHAT_ID, message, "PRO");
+      if (!proResult.ok) {
+        // Even when Pro fails, still schedule the Legacy send so
+        // subscribers on the delayed channel don't lose the alert
+        // just because Pro had a hiccup.
+        scheduleLegacyTelegramSend(message, licenceKey);
+        return json(res, 502, { ok: false, reason: "telegram_error", detail: proResult.error });
       }
-      console.log(`[ALERT] Sent for ${licenceKey}: ${alert.missionName}/${alert.subcategory}/${alert.city}`);
+      console.log(`[ALERT] Pro sent for ${licenceKey}: ${alert.missionName}/${alert.subcategory}/${alert.city}`);
+    } else if (TELEGRAM_CHAT_ID) {
+      // No Pro channel configured — fall back to sending the Legacy
+      // channel immediately with no delay. Preserves behaviour for
+      // deployments that haven't set TELEGRAM_PRO_CHAT_ID yet.
+      const legacyResult = await sendTelegramToChat(TELEGRAM_CHAT_ID, message, "LEGACY-IMMEDIATE");
+      if (!legacyResult.ok) {
+        return json(res, 502, { ok: false, reason: "telegram_error", detail: legacyResult.error });
+      }
+      console.log(`[ALERT] Legacy immediate sent for ${licenceKey} (no Pro configured): ${alert.missionName}/${alert.subcategory}/${alert.city}`);
       return json(res, 200, { ok: true });
-    } catch (err) {
-      console.error("[ALERT] Fetch error:", err.message);
-      return json(res, 502, { ok: false, reason: "network_error" });
+    } else {
+      // Neither channel configured — shouldn't happen given the
+      // TELEGRAM_ENABLED guard above, but bail cleanly if it does.
+      return json(res, 503, { ok: false, reason: "no_channels_configured" });
     }
+
+    // 6. Schedule the Legacy mirror. Fire-and-forget; the extension's
+    //    Pro-channel confirmation has already been sent.
+    scheduleLegacyTelegramSend(message, licenceKey);
+
+    return json(res, 200, { ok: true });
   }
 
   return json(res, 404, { ok: false, error: "Not found" });
