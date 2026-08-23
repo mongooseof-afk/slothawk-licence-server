@@ -170,6 +170,9 @@ async function initDB() {
       booking_events     JSONB NOT NULL DEFAULT '[]'
     )
   `);
+  // Existing Render databases may predate booking_events. CREATE TABLE IF
+  // NOT EXISTS does not add new columns to an already-created table.
+  await pool.query(`ALTER TABLE licences ADD COLUMN IF NOT EXISTS booking_events JSONB NOT NULL DEFAULT '[]'::jsonb`);
   console.log("[DB] Tables ready");
 }
 
@@ -749,6 +752,60 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, expiresAt: licence.expires_at });
     } catch {
       return json(res, 200, { ok: false, reason: "invalid_token" });
+    }
+  }
+
+  // ── POST /booking-events ─────────────────────────────────────────────────
+  // The extension reports only a confirmed result: payment-link extracted or
+  // waitlist confirmed. The timestamp and client IP are assigned server-side;
+  // no payment URL, applicant, passport, or VFS token is stored.
+  if (req.method === "POST" && url === "/booking-events") {
+    const body = await readBody(req);
+    const token = String(body.token || "").trim();
+    const eventType = String(body.eventType || "").trim();
+    const clean = (value, max = 120) => String(value || "").trim().slice(0, max);
+    const mission = clean(body.mission, 40);
+    const city = clean(body.city);
+    const subcategory = clean(body.subcategory);
+    const slotDate = clean(body.slotDate, 32) || null;
+
+    if (!token) return json(res, 401, { ok: false, reason: "missing_token" });
+    if (!['payment_link', 'waitlist', 'booking'].includes(eventType) || !mission || !subcategory) {
+      return json(res, 400, { ok: false, reason: "invalid_booking_event" });
+    }
+
+    try {
+      const decoded = jwt.verify(token, JWT_SECRET);
+      const { rows } = await pool.query(
+        `SELECT status, expires_at, deactivated, blocked, booking_events FROM licences WHERE license_key = $1`,
+        [decoded.license_key]
+      );
+      const licence = rows[0];
+      if (!licence || licence.deactivated || licence.blocked || licence.status !== "active" ||
+          (licence.expires_at && new Date() > new Date(licence.expires_at))) {
+        return json(res, 403, { ok: false, reason: "licence_inactive" });
+      }
+
+      const events = Array.isArray(licence.booking_events) ? licence.booking_events : [];
+      const event = {
+        id: uuidv4(),
+        createdAt: new Date().toISOString(),
+        success: true,
+        eventType,
+        mission,
+        city: city || null,
+        subcategory,
+        slotDate,
+        reason: null,
+        machineId: decoded.machine_id || null,
+        ip: getClientIp(req),
+      };
+      events.unshift(event);
+      if (events.length > 200) events.length = 200;
+      await pool.query(`UPDATE licences SET booking_events = $1 WHERE license_key = $2`, [JSON.stringify(events), decoded.license_key]);
+      return json(res, 201, { ok: true, event });
+    } catch {
+      return json(res, 401, { ok: false, reason: "invalid_token" });
     }
   }
 
