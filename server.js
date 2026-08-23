@@ -457,7 +457,27 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "PATCH" && url.includes("/clear-block")) {
     const id = extractIdFromUrl(url);
     try {
-      const result = await pool.query(`UPDATE licences SET blocked = FALSE, suspicious = FALSE, suspicious_reason = NULL WHERE id = $1 OR license_key = $1`, [id]);
+      // Clear Block is the operator's "let this user continue" action.
+      // Previously it removed only the block flags while leaving status
+      // revoked, so a correctly cleared licence was still rejected by every
+      // extension authentication/heartbeat call. Keep the bound machine and
+      // restore an unexpired licence to active; an expired licence remains
+      // expired and an unbound licence returns to pending activation.
+      const result = await pool.query(
+        `UPDATE licences SET
+          blocked = FALSE,
+          suspicious = FALSE,
+          suspicious_reason = NULL,
+          deactivated = FALSE,
+          active = CASE WHEN expires_at IS NULL OR expires_at > NOW() THEN TRUE ELSE FALSE END,
+          status = CASE
+            WHEN expires_at IS NOT NULL AND expires_at <= NOW() THEN 'expired'
+            WHEN machine_id IS NOT NULL THEN 'active'
+            ELSE 'pending'
+          END
+         WHERE id = $1 OR license_key = $1`,
+        [id]
+      );
       console.log(`[CLEAR-BLOCK] id=${id} rows=${result.rowCount}`);
       return json(res, 200, { ok: true });
     } catch (err) { return json(res, 500, { ok: false, error: err.message }); }
