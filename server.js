@@ -9,6 +9,7 @@ const crypto = require("crypto");
 const jwt    = require("jsonwebtoken");
 const { Pool } = require("pg");
 const { v4: uuidv4 } = require("uuid");
+const { WebSocketServer } = require("ws");
 
 const PORT        = parseInt(process.env.PORT) || 8765;
 const JWT_SECRET  = process.env.JWT_SECRET;
@@ -48,6 +49,62 @@ const ALERT_RATE_LIMIT      = 20;
 const ALERT_RATE_WINDOW_MS  = 60_000;
 const alertRateMap = new Map(); // license_key → [timestamps]
 
+// ── Global Signal relay ──────────────────────────────────────────────
+// Connections stay only in process memory. A signal deliberately carries
+// no VFS token, applicant, or appointment-date data: it is just a fast
+// "check now" wake-up for other licensed SlotHawk profiles.
+const SIGNAL_AUTH_TIMEOUT_MS = 10_000;
+const SIGNAL_RATE_LIMIT      = 12;
+const SIGNAL_RATE_WINDOW_MS  = 60_000;
+const signalRooms            = new Map(); // channel → Set<WebSocket>
+const signalRateMap          = new Map(); // licence key → [timestamps]
+
+function signalChannel(mission, city, subcategory) {
+  const fields = [mission, city, subcategory].map(v => String(v || "").trim());
+  if (fields.some(v => !v || v.length > 120)) return "";
+  return fields.join("::");
+}
+
+function checkSignalRateLimit(key) {
+  const now = Date.now();
+  const hits = (signalRateMap.get(key) || []).filter(t => now - t < SIGNAL_RATE_WINDOW_MS);
+  if (hits.length >= SIGNAL_RATE_LIMIT) {
+    signalRateMap.set(key, hits);
+    return false;
+  }
+  hits.push(now);
+  signalRateMap.set(key, hits);
+  return true;
+}
+
+function leaveSignalRoom(ws) {
+  const channel = ws.signalChannel;
+  if (!channel) return;
+  const room = signalRooms.get(channel);
+  if (!room) return;
+  room.delete(ws);
+  if (room.size === 0) signalRooms.delete(channel);
+  ws.signalChannel = "";
+}
+
+async function authenticateSignalToken(token) {
+  let decoded;
+  try { decoded = jwt.verify(String(token || ""), JWT_SECRET); }
+  catch { return null; }
+
+  const licenceKey = decoded.license_key;
+  if (!licenceKey) return null;
+  const { rows } = await pool.query(
+    `SELECT status, expires_at, deactivated, blocked FROM licences WHERE license_key = $1`,
+    [licenceKey]
+  );
+  const licence = rows[0];
+  if (!licence || licence.deactivated || licence.blocked ||
+      licence.status !== "active" ||
+      (licence.expires_at && new Date() > new Date(licence.expires_at))) return null;
+  return { licenceKey };
+}
+
 function checkAlertRateLimit(key) {
   const now = Date.now();
   const arr = (alertRateMap.get(key) || []).filter(t => now - t < ALERT_RATE_WINDOW_MS);
@@ -68,6 +125,11 @@ setInterval(() => {
     const filtered = arr.filter(t => now - t < ALERT_RATE_WINDOW_MS);
     if (filtered.length === 0) alertRateMap.delete(key);
     else alertRateMap.set(key, filtered);
+  }
+  for (const [key, hits] of signalRateMap.entries()) {
+    const filtered = hits.filter(t => now - t < SIGNAL_RATE_WINDOW_MS);
+    if (filtered.length === 0) signalRateMap.delete(key);
+    else signalRateMap.set(key, filtered);
   }
 }, 5 * 60_000);
 
@@ -794,6 +856,103 @@ const server = http.createServer(async (req, res) => {
   }
 
   return json(res, 404, { ok: false, error: "Not found" });
+});
+
+// ── WSS /signal ──────────────────────────────────────────────────────
+// The normal HTTP server owns upgrades so Render exposes API and signal
+// relay through the same public service/domain.
+const signalWss = new WebSocketServer({
+  noServer: true,
+  maxPayload: 4096,
+  perMessageDeflate: false,
+});
+
+server.on("upgrade", (req, socket, head) => {
+  const pathname = new URL(req.url, "http://localhost").pathname;
+  if (pathname !== "/signal") {
+    socket.destroy();
+    return;
+  }
+  signalWss.handleUpgrade(req, socket, head, (ws) => {
+    signalWss.emit("connection", ws, req);
+  });
+});
+
+signalWss.on("connection", (ws) => {
+  ws.signalAuthorised = false;
+  ws.signalChannel = "";
+  ws.signalLicenceKey = "";
+
+  const authTimer = setTimeout(() => {
+    if (!ws.signalAuthorised) ws.close(4001, "auth_timeout");
+  }, SIGNAL_AUTH_TIMEOUT_MS);
+
+  ws.on("message", async (raw) => {
+    let message;
+    try { message = JSON.parse(String(raw)); }
+    catch { ws.close(4002, "invalid_json"); return; }
+
+    if (!ws.signalAuthorised) {
+      if (message?.type !== "auth") {
+        ws.close(4003, "auth_required");
+        return;
+      }
+      const identity = await authenticateSignalToken(message.token);
+      const channel = signalChannel(message.mission, message.city, message.subcategory);
+      if (!identity || !channel) {
+        ws.close(4004, "unauthorized");
+        return;
+      }
+      clearTimeout(authTimer);
+      ws.signalAuthorised = true;
+      ws.signalLicenceKey = identity.licenceKey;
+      ws.signalChannel = channel;
+      if (!signalRooms.has(channel)) signalRooms.set(channel, new Set());
+      signalRooms.get(channel).add(ws);
+      ws.send(JSON.stringify({ type: "ready", channel }));
+      return;
+    }
+
+    if (message?.type === "subscribe") {
+      const channel = signalChannel(message.mission, message.city, message.subcategory);
+      if (!channel) { ws.send(JSON.stringify({ type: "error", reason: "invalid_channel" })); return; }
+      leaveSignalRoom(ws);
+      ws.signalChannel = channel;
+      if (!signalRooms.has(channel)) signalRooms.set(channel, new Set());
+      signalRooms.get(channel).add(ws);
+      ws.send(JSON.stringify({ type: "ready", channel }));
+      return;
+    }
+
+    if (message?.type !== "slot_found") return;
+    const channel = signalChannel(message.mission, message.city, message.subcategory);
+    if (!channel || channel !== ws.signalChannel || typeof message.eventId !== "string" || message.eventId.length < 8 || message.eventId.length > 128) {
+      ws.send(JSON.stringify({ type: "error", reason: "invalid_signal" }));
+      return;
+    }
+    if (!checkSignalRateLimit(ws.signalLicenceKey)) {
+      ws.send(JSON.stringify({ type: "error", reason: "rate_limited" }));
+      return;
+    }
+
+    const payload = JSON.stringify({
+      type: "slot_found",
+      eventId: message.eventId,
+      mission: String(message.mission).trim(),
+      city: String(message.city).trim(),
+      subcategory: String(message.subcategory).trim(),
+      sentAt: new Date().toISOString(),
+    });
+    for (const peer of signalRooms.get(channel) || []) {
+      if (peer.readyState === 1) peer.send(payload);
+    }
+  });
+
+  ws.on("close", () => {
+    clearTimeout(authTimer);
+    leaveSignalRoom(ws);
+  });
+  ws.on("error", () => {});
 });
 
 initDB().then(() => {
