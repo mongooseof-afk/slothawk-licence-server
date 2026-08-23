@@ -87,6 +87,32 @@ function leaveSignalRoom(ws) {
   ws.signalChannel = "";
 }
 
+// A server-originated signal is emitted when the trusted notification
+// endpoint receives a confirmed slot alert. It uses the same room protocol
+// as browser-originated signals, but the server generates the event id so
+// every connected profile receives one canonical wake-up event.
+function broadcastServerSlotFound({ mission, city, subcategory }) {
+  const channel = signalChannel(mission, city, subcategory);
+  if (!channel) return { sent: false, recipients: 0 };
+  const payload = JSON.stringify({
+    type: "slot_found",
+    eventId: `server-${uuidv4()}`,
+    mission: String(mission).trim(),
+    city: String(city).trim(),
+    subcategory: String(subcategory).trim(),
+    sentAt: new Date().toISOString(),
+    source: "telegram_alert",
+  });
+  let recipients = 0;
+  for (const peer of signalRooms.get(channel) || []) {
+    if (peer.readyState === 1) {
+      peer.send(payload);
+      recipients += 1;
+    }
+  }
+  return { sent: true, recipients };
+}
+
 async function authenticateSignalToken(token) {
   let decoded;
   try { decoded = jwt.verify(String(token || ""), JWT_SECRET); }
@@ -834,7 +860,7 @@ const server = http.createServer(async (req, res) => {
   // token stays server-side. JWT-authenticated, licence-status-checked,
   // rate-limited (20/min per licence).
   //
-  // Request body: { token: "<JWT>", alert: { missionName, city, subcategory } }
+  // Request body: { token: "<JWT>", alert: { missionKey, missionName, cityCode, subcategory } }
   // The `earliestDate` field is intentionally NOT accepted here — if the
   // extension ever sends it, we strip it before building the message.
   if (req.method === "POST" && url === "/alert/telegram") {
@@ -894,6 +920,15 @@ const server = http.createServer(async (req, res) => {
       subcategory: String(alert.subcategory || ""),
     });
 
+    // The Telegram alert is now also the canonical source for the Tourism
+    // Global Signal. This happens server-side so all subscribed profiles
+    // receive the same event, not separate client-originated broadcasts.
+    const signalResult = broadcastServerSlotFound({
+      mission: alert.missionKey,
+      city: alert.cityCode || alert.city,
+      subcategory: alert.subcategory,
+    });
+
     // 5. Send to the Pro channel immediately. This is the request the
     //    extension is waiting on — its success/failure is what we return.
     //    The Legacy channel is scheduled separately (see step 6) and its
@@ -906,7 +941,7 @@ const server = http.createServer(async (req, res) => {
         // subscribers on the delayed channel don't lose the alert
         // just because Pro had a hiccup.
         scheduleLegacyTelegramSend(message, licenceKey);
-        return json(res, 502, { ok: false, reason: "telegram_error", detail: proResult.error });
+        return json(res, 502, { ok: false, reason: "telegram_error", detail: proResult.error, signalSent: signalResult.sent });
       }
       console.log(`[ALERT] Pro sent for ${licenceKey}: ${alert.missionName}/${alert.subcategory}/${alert.city}`);
     } else if (TELEGRAM_CHAT_ID) {
@@ -915,10 +950,10 @@ const server = http.createServer(async (req, res) => {
       // deployments that haven't set TELEGRAM_PRO_CHAT_ID yet.
       const legacyResult = await sendTelegramToChat(TELEGRAM_CHAT_ID, message, "LEGACY-IMMEDIATE");
       if (!legacyResult.ok) {
-        return json(res, 502, { ok: false, reason: "telegram_error", detail: legacyResult.error });
+        return json(res, 502, { ok: false, reason: "telegram_error", detail: legacyResult.error, signalSent: signalResult.sent });
       }
       console.log(`[ALERT] Legacy immediate sent for ${licenceKey} (no Pro configured): ${alert.missionName}/${alert.subcategory}/${alert.city}`);
-      return json(res, 200, { ok: true });
+      return json(res, 200, { ok: true, signalSent: signalResult.sent });
     } else {
       // Neither channel configured — shouldn't happen given the
       // TELEGRAM_ENABLED guard above, but bail cleanly if it does.
@@ -929,7 +964,7 @@ const server = http.createServer(async (req, res) => {
     //    Pro-channel confirmation has already been sent.
     scheduleLegacyTelegramSend(message, licenceKey);
 
-    return json(res, 200, { ok: true });
+    return json(res, 200, { ok: true, signalSent: signalResult.sent });
   }
 
   return json(res, 404, { ok: false, error: "Not found" });
