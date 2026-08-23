@@ -14,6 +14,9 @@ const PORT        = parseInt(process.env.PORT) || 8765;
 const JWT_SECRET  = process.env.JWT_SECRET;
 const JWT_EXPIRES = process.env.JWT_EXPIRES_IN || "7d";
 const SESSION_GAP = 10 * 60 * 1000;
+// Shared only with the Dashboard backend. Never ship this value to the
+// browser/extension: it protects all administrative licence operations.
+const DASHBOARD_API_KEY = process.env.DASHBOARD_API_KEY || "";
 
 // ── Telegram alert config ────────────────────────────────────────────
 // Extension no longer holds the bot token — it POSTs to /alert/telegram
@@ -133,6 +136,22 @@ function json(res, statusCode, body) {
     "Access-Control-Allow-Headers": "Content-Type, Authorization",
   });
   res.end(JSON.stringify(body));
+}
+
+function isAdminRoute(url) {
+  return url === "/admin/licences" ||
+    url.startsWith("/admin/licences/") ||
+    url === "/api/admin/licences" ||
+    url.startsWith("/api/admin/licences/");
+}
+
+function hasValidDashboardApiKey(req) {
+  const supplied = req.headers["x-api-key"];
+  if (!DASHBOARD_API_KEY || typeof supplied !== "string") return false;
+
+  const expected = Buffer.from(DASHBOARD_API_KEY);
+  const actual = Buffer.from(supplied);
+  return expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
 }
 
 function getClientIp(req) {
@@ -278,6 +297,12 @@ const server = http.createServer(async (req, res) => {
   }
 
   const url = req.url.split("?")[0];
+
+  // The dashboard backend is the only allowed caller for licence-admin
+  // routes. All extension endpoints keep their existing JWT-based access.
+  if (isAdminRoute(url) && !hasValidDashboardApiKey(req)) {
+    return json(res, 401, { ok: false, error: "Unauthorized" });
+  }
 
   if (req.method === "GET" && url === "/health") {
     return json(res, 200, { status: "ok", version: "7.3.0", requiredExtensionVersion: process.env.REQUIRED_VERSION || "0.2.10" });
