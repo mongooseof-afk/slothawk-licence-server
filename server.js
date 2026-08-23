@@ -302,10 +302,14 @@ function formatMoroccoTimestamp(date) {
   return `${pad(shifted.getUTCHours())}:${pad(shifted.getUTCMinutes())}:${pad(shifted.getUTCSeconds())}`;
 }
 
-const MISSION_FLAGS = { Malta: "🇲🇹", Austria: "🇦🇹" };
+const MISSION_FLAGS = {
+  Malta: "🇲🇹", Austria: "🇦🇹", Finland: "🇫🇮", Sweden: "🇸🇪",
+  Croatia: "🇭🇷", Netherlands: "🇳🇱",
+};
 const CITY_NAMES = {
   MLMCS: "Casablanca", MLMRBT: "Rabat", MLMTGR: "Tangier",
   ASCA: "Casablanca", ASRB: "Rabat", TVC: "Tangier",
+  NER: "Rabat", NTTG: "Tangier", Rbt: "Rabat", SWRA: "Rabat", CVARC: "Rabat",
 };
 
 function buildSlotAlertMessage({ missionName, city, subcategory }) {
@@ -318,10 +322,8 @@ function buildSlotAlertMessage({ missionName, city, subcategory }) {
     "▬▬▬▬▬▬▬▬▬▬▬▬▬▬",
     `PAYS: ${escapeMarkdownV2(missionName)} ${flag}`,
     `TYPE: ${escapeMarkdownV2(subcategory)}`,
-    `📍 ${escapeMarkdownV2(cityName)}`,
-    "",
+    `📍 *${escapeMarkdownV2(cityName)}*`,
     `Spotted at ${escapeMarkdownV2(time)}`,
-    "",
     "🛩️ *DIVE IN NOW*",
   ].join("\n");
 }
@@ -923,11 +925,13 @@ const server = http.createServer(async (req, res) => {
     // The Telegram alert is now also the canonical source for the Tourism
     // Global Signal. This happens server-side so all subscribed profiles
     // receive the same event, not separate client-originated broadcasts.
-    const signalResult = broadcastServerSlotFound({
-      mission: alert.missionKey,
-      city: alert.cityCode || alert.city,
-      subcategory: alert.subcategory,
-    });
+    const signalResult = alert.signal === false
+      ? { sent: false, recipients: 0 }
+      : broadcastServerSlotFound({
+          mission: alert.missionKey,
+          city: alert.cityCode || alert.city,
+          subcategory: alert.subcategory,
+        });
 
     // 5. Send to the Pro channel immediately. This is the request the
     //    extension is waiting on — its success/failure is what we return.
