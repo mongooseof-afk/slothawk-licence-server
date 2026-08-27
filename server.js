@@ -19,6 +19,16 @@ const SESSION_GAP = 10 * 60 * 1000;
 // browser/extension: it protects all administrative licence operations.
 const DASHBOARD_API_KEY = process.env.DASHBOARD_API_KEY || "";
 
+// VPS ingress is disabled until this 32+ byte secret is configured on BOTH
+// the VPS and this server. It never ships to the extension or Telegram.
+const VPS_SIGNAL_KEY_ID = (process.env.VPS_SIGNAL_KEY_ID || "vps-primary").trim();
+const VPS_SIGNAL_HMAC_SECRET = process.env.VPS_SIGNAL_HMAC_SECRET || "";
+const VPS_SIGNAL_ENABLED = Buffer.byteLength(VPS_SIGNAL_HMAC_SECRET, "utf8") >= 32;
+const VPS_SIGNAL_MAX_AGE_MS = 30_000;
+const VPS_SIGNAL_BODY_LIMIT_BYTES = 4 * 1024;
+const VPS_SIGNAL_RATE_LIMIT = 12;
+const VPS_SIGNAL_RATE_WINDOW_MS = 60_000;
+
 // ── Telegram alert config ────────────────────────────────────────────
 // Extension no longer holds the bot token — it POSTs to /alert/telegram
 // with a JWT, and this server verifies + forwards to Telegram.
@@ -48,6 +58,7 @@ if (!TELEGRAM_ENABLED) {
 const ALERT_RATE_LIMIT      = 20;
 const ALERT_RATE_WINDOW_MS  = 60_000;
 const alertRateMap = new Map(); // license_key → [timestamps]
+const vpsSignalRateMap = new Map(); // issuer key id → [timestamps]
 
 // ── Global Signal relay ──────────────────────────────────────────────
 // Connections stay only in process memory. A signal deliberately carries
@@ -143,6 +154,20 @@ function checkAlertRateLimit(key) {
   return true;
 }
 
+function checkVpsSignalRateLimit(issuer) {
+  const now = Date.now();
+  const hits = (vpsSignalRateMap.get(issuer) || []).filter(
+    (time) => now - time < VPS_SIGNAL_RATE_WINDOW_MS
+  );
+  if (hits.length >= VPS_SIGNAL_RATE_LIMIT) {
+    vpsSignalRateMap.set(issuer, hits);
+    return false;
+  }
+  hits.push(now);
+  vpsSignalRateMap.set(issuer, hits);
+  return true;
+}
+
 // Periodic cleanup so the Map doesn't grow unbounded over the process
 // lifetime. Runs every 5 minutes, drops entries with no recent hits.
 setInterval(() => {
@@ -156,6 +181,11 @@ setInterval(() => {
     const filtered = hits.filter(t => now - t < SIGNAL_RATE_WINDOW_MS);
     if (filtered.length === 0) signalRateMap.delete(key);
     else signalRateMap.set(key, filtered);
+  }
+  for (const [issuer, hits] of vpsSignalRateMap.entries()) {
+    const filtered = hits.filter(t => now - t < VPS_SIGNAL_RATE_WINDOW_MS);
+    if (filtered.length === 0) vpsSignalRateMap.delete(issuer);
+    else vpsSignalRateMap.set(issuer, filtered);
   }
 }, 5 * 60_000);
 
@@ -199,6 +229,20 @@ async function initDB() {
   // Existing Render databases may predate booking_events. CREATE TABLE IF
   // NOT EXISTS does not add new columns to an already-created table.
   await pool.query(`ALTER TABLE licences ADD COLUMN IF NOT EXISTS booking_events JSONB NOT NULL DEFAULT '[]'::jsonb`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS vps_signal_events (
+      event_id UUID PRIMARY KEY,
+      received_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS vps_signal_events_received_at_idx
+      ON vps_signal_events (received_at)
+  `);
+  await pool.query(`
+    DELETE FROM vps_signal_events
+      WHERE received_at < NOW() - INTERVAL '24 hours'
+  `);
   console.log("[DB] Tables ready");
 }
 
@@ -217,6 +261,95 @@ function readBody(req) {
     req.on("end", () => { try { resolve(JSON.parse(data || "{}")); } catch { resolve({}); } });
     req.on("error", reject);
   });
+}
+
+function readRawBody(req, maxBytes = VPS_SIGNAL_BODY_LIMIT_BYTES) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let bytes = 0;
+    let tooLarge = false;
+    req.on("data", (chunk) => {
+      bytes += chunk.length;
+      if (bytes > maxBytes) {
+        tooLarge = true;
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on("end", () => {
+      if (tooLarge) {
+        const error = new Error("payload_too_large");
+        error.code = "PAYLOAD_TOO_LARGE";
+        return reject(error);
+      }
+      resolve(Buffer.concat(chunks));
+    });
+    req.on("error", reject);
+  });
+}
+
+function equalTextConstantTime(expected, supplied) {
+  if (typeof supplied !== "string") return false;
+  const expectedBuffer = Buffer.from(expected);
+  const suppliedBuffer = Buffer.from(supplied);
+  return expectedBuffer.length === suppliedBuffer.length &&
+    crypto.timingSafeEqual(expectedBuffer, suppliedBuffer);
+}
+
+function verifiedVpsIssuer(req, rawBody) {
+  if (!VPS_SIGNAL_ENABLED) return "";
+  const keyId = req.headers["x-slothawk-key-id"];
+  const timestamp = req.headers["x-slothawk-timestamp"];
+  const signature = req.headers["x-slothawk-signature"];
+
+  if (!equalTextConstantTime(VPS_SIGNAL_KEY_ID, keyId) ||
+      typeof timestamp !== "string" ||
+      !/^\d{10}$/.test(timestamp) ||
+      typeof signature !== "string" ||
+      !/^[a-f0-9]{64}$/i.test(signature)) {
+    return "";
+  }
+
+  const timestampMs = Number(timestamp) * 1000;
+  if (!Number.isSafeInteger(timestampMs) ||
+      Math.abs(Date.now() - timestampMs) > VPS_SIGNAL_MAX_AGE_MS) {
+    return "";
+  }
+
+  const expectedSignature = crypto
+    .createHmac("sha256", VPS_SIGNAL_HMAC_SECRET)
+    .update(timestamp, "utf8")
+    .update(".", "utf8")
+    .update(rawBody)
+    .digest("hex");
+
+  return equalTextConstantTime(expectedSignature, signature) ? keyId : "";
+}
+
+function normalizeVpsSignal(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return null;
+  const allowedKeys = new Set(["eventId", "mission", "city", "subcategory", "foundAt"]);
+  if (Object.keys(body).some((key) => !allowedKeys.has(key))) return null;
+
+  const eventId = String(body.eventId || "").trim();
+  const mission = String(body.mission || "").trim().toLowerCase();
+  const city = String(body.city || "").trim();
+  const subcategory = String(body.subcategory || "").trim();
+  const target = VPS_SIGNAL_TARGETS[mission];
+
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(eventId) ||
+      !target ||
+      !target.cities.has(city) ||
+      !/^[A-Za-z0-9][A-Za-z0-9 .&()/_-]{0,63}$/.test(subcategory)) {
+    return null;
+  }
+
+  if (body.foundAt !== undefined) {
+    const foundAt = String(body.foundAt);
+    if (foundAt.length > 40 || Number.isNaN(Date.parse(foundAt))) return null;
+  }
+
+  return { eventId, mission, city, subcategory, missionName: target.missionName };
 }
 
 function json(res, statusCode, body) {
@@ -311,6 +444,17 @@ const CITY_NAMES = {
   ASCA: "Casablanca", ASRB: "Rabat", TVC: "Tangier",
   NER: "Rabat", NTTG: "Tangier", Rbt: "Rabat", SWRA: "Rabat", CVARC: "Rabat",
 };
+
+// The VPS can only signal destinations SlotHawk explicitly supports. The
+// human-readable country/city strings are server-owned, never trusted input.
+const VPS_SIGNAL_TARGETS = Object.freeze({
+  mlt: Object.freeze({ missionName: "Malta",       cities: new Set(["MLMCS", "MLMRBT", "MLMTGR"]) }),
+  aut: Object.freeze({ missionName: "Austria",     cities: new Set(["ASCA", "ASRB", "TVC"]) }),
+  fin: Object.freeze({ missionName: "Finland",     cities: new Set(["Rbt"]) }),
+  swe: Object.freeze({ missionName: "Sweden",      cities: new Set(["SWRA"]) }),
+  hrv: Object.freeze({ missionName: "Croatia",     cities: new Set(["CVARC"]) }),
+  nld: Object.freeze({ missionName: "Netherlands", cities: new Set(["NER", "NTTG"]) }),
+});
 
 function buildSlotAlertMessage({ missionName, city, subcategory }) {
   const flag     = MISSION_FLAGS[missionName] || "🌍";
@@ -857,6 +1001,94 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  // ── POST /v1/signals/vps ─────────────────────────────────────────────────
+  // Trusted VPS ingress. Requests are HMAC-signed over the exact raw JSON body,
+  // timestamp-bound, rate-limited, destination-allowlisted and deduplicated.
+  if (req.method === "POST" && url === "/v1/signals/vps") {
+    if (!VPS_SIGNAL_ENABLED) {
+      // Keep an unconfigured private ingress undiscoverable.
+      return json(res, 404, { ok: false, error: "Not found" });
+    }
+
+    let rawBody;
+    try {
+      rawBody = await readRawBody(req);
+    } catch (error) {
+      return json(res, error?.code === "PAYLOAD_TOO_LARGE" ? 413 : 400, {
+        ok: false,
+        error: "invalid_payload",
+      });
+    }
+
+    const issuer = verifiedVpsIssuer(req, rawBody);
+    if (!issuer) return json(res, 401, { ok: false, error: "invalid_signature" });
+
+    let body;
+    try {
+      body = JSON.parse(rawBody.toString("utf8"));
+    } catch {
+      return json(res, 400, { ok: false, error: "invalid_payload" });
+    }
+
+    const event = normalizeVpsSignal(body);
+    if (!event) return json(res, 400, { ok: false, error: "invalid_signal" });
+    if (!checkVpsSignalRateLimit(issuer)) {
+      return json(res, 429, { ok: false, error: "rate_limited" });
+    }
+    if (!TELEGRAM_ENABLED) {
+      return json(res, 503, { ok: false, error: "telegram_disabled" });
+    }
+
+    try {
+      const claim = await pool.query(
+        `INSERT INTO vps_signal_events (event_id) VALUES ($1)
+         ON CONFLICT DO NOTHING
+         RETURNING event_id`,
+        [event.eventId]
+      );
+      if (claim.rowCount === 0) {
+        return json(res, 200, { ok: true, duplicate: true });
+      }
+    } catch (error) {
+      console.error("[VPS SIGNAL] event claim failed:", error.message);
+      return json(res, 503, { ok: false, error: "storage_unavailable" });
+    }
+
+    const message = buildSlotAlertMessage({
+      missionName: event.missionName,
+      city: event.city,
+      subcategory: event.subcategory,
+    });
+
+    let telegramResult;
+    if (TELEGRAM_PRO_CHAT_ID) {
+      telegramResult = await sendTelegramToChat(TELEGRAM_PRO_CHAT_ID, message, "VPS-PRO");
+      if (telegramResult.ok) scheduleLegacyTelegramSend(message, "vps");
+    } else if (TELEGRAM_CHAT_ID) {
+      telegramResult = await sendTelegramToChat(TELEGRAM_CHAT_ID, message, "VPS-LEGACY-IMMEDIATE");
+    } else {
+      telegramResult = { ok: false, error: "no_channels_configured" };
+    }
+
+    if (!telegramResult.ok) {
+      // A failed delivery is retryable with the same event id.
+      await pool.query(`DELETE FROM vps_signal_events WHERE event_id = $1`, [event.eventId])
+        .catch((error) => console.error("[VPS SIGNAL] event release failed:", error.message));
+      return json(res, 502, { ok: false, error: "telegram_error" });
+    }
+
+    // Only a successfully posted Telegram notification may wake extensions.
+    const signalResult = broadcastServerSlotFound(event);
+    console.log(`[VPS SIGNAL] accepted ${event.mission}/${event.city}/${event.subcategory}; recipients=${signalResult.recipients}`);
+
+    return json(res, 200, {
+      ok: true,
+      duplicate: false,
+      telegramSent: true,
+      signalRecipients: signalResult.recipients,
+    });
+  }
+
   // ── POST /alert/telegram ──────────────────────────────────────────────────
   // Extension calls this instead of api.telegram.org directly, so the bot
   // token stays server-side. JWT-authenticated, licence-status-checked,
@@ -1071,7 +1303,16 @@ signalWss.on("connection", (ws) => {
   ws.on("error", () => {});
 });
 
+async function cleanupVpsSignalEvents() {
+  try {
+    await pool.query(`DELETE FROM vps_signal_events WHERE received_at < NOW() - INTERVAL '24 hours'`);
+  } catch (error) {
+    console.error("[VPS SIGNAL] event cleanup failed:", error.message);
+  }
+}
+
 initDB().then(() => {
+  setInterval(() => { void cleanupVpsSignalEvents(); }, 60 * 60_000).unref?.();
   server.listen(PORT, "0.0.0.0", () => {
     console.log(`SlotHawk API -> port ${PORT}`);
   });
