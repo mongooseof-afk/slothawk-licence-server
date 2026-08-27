@@ -971,47 +971,6 @@ const server = http.createServer(async (req, res) => {
     return json(res, 200, { ok: true, signalSent: signalResult.sent });
   }
 
-  // ── POST /admin/test-global-signal ───────────────────────────────
-  // Disabled by default. The target is intentionally fixed so this endpoint
-  // cannot be used to broadcast arbitrary appointment availability.
-  if (req.method === "POST" && url === "/admin/test-global-signal") {
-    const suppliedTestKey = req.headers["x-signal-test-key"];
-    const configuredTestKey = process.env.TEST_SIGNAL_KEY || "";
-    const testKeyOk =
-      typeof suppliedTestKey === "string" &&
-      configuredTestKey.length > 0 &&
-      suppliedTestKey.length === configuredTestKey.length &&
-      crypto.timingSafeEqual(
-        Buffer.from(suppliedTestKey),
-        Buffer.from(configuredTestKey)
-      );
-
-    // Respond as if the route does not exist when either secret is invalid.
-    if (!hasValidDashboardApiKey(req) || !testKeyOk) {
-      return json(res, 404, { ok: false, error: "Not found" });
-    }
-
-    const testSignal = {
-      mission: "mlt",
-      city: "MLMCS",
-      subcategory: "Business",
-    };
-
-    const first = broadcastServerSlotFound(testSignal);
-    // The short gap delivers a second event while the first booking request
-    // is still pending, exercising the extension's no-loop/mutex guard.
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    const second = broadcastServerSlotFound(testSignal);
-
-    return json(res, 200, {
-      ok: true,
-      test: "Malta / Casablanca / Business",
-      signalsSent: 2,
-      firstRecipients: first.recipients,
-      secondRecipients: second.recipients,
-    });
-  }
-
   return json(res, 404, { ok: false, error: "Not found" });
 });
 
