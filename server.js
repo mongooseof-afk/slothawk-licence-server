@@ -29,12 +29,6 @@ const VPS_SIGNAL_BODY_LIMIT_BYTES = 4 * 1024;
 const VPS_SIGNAL_RATE_LIMIT = 12;
 const VPS_SIGNAL_RATE_WINDOW_MS = 60_000;
 
-// Temporary, fixed-target test trigger. It is disabled unless a separate
-// 32+ byte secret exists, and it never accepts a caller-controlled target.
-const SIGNAL_TEST_KEY = process.env.SIGNAL_TEST_KEY || "";
-const SIGNAL_TEST_ENABLED = Buffer.byteLength(SIGNAL_TEST_KEY, "utf8") >= 32;
-const SIGNAL_TEST_COOLDOWN_MS = 60_000;
-let lastSignalTestAt = 0;
 
 // ── Telegram alert config ────────────────────────────────────────────
 // Extension no longer holds the bot token — it POSTs to /alert/telegram
@@ -335,9 +329,8 @@ function verifiedVpsIssuer(req, rawBody) {
 
 function normalizeVpsSignal(body) {
   if (!body || typeof body !== "object" || Array.isArray(body)) return null;
-  const allowedKeys = new Set(["eventId", "mission", "city", "subcategory", "foundAt", "test"]);
+  const allowedKeys = new Set(["eventId", "mission", "city", "subcategory", "foundAt"]);
   if (Object.keys(body).some((key) => !allowedKeys.has(key))) return null;
-  if (body.test !== undefined && typeof body.test !== "boolean") return null;
 
   const eventId = String(body.eventId || "").trim();
   const mission = String(body.mission || "").trim().toLowerCase();
@@ -357,14 +350,7 @@ function normalizeVpsSignal(body) {
     if (foundAt.length > 40 || Number.isNaN(Date.parse(foundAt))) return null;
   }
 
-  return {
-    eventId,
-    mission,
-    city,
-    subcategory,
-    missionName: target.missionName,
-    test: body.test === true,
-  };
+  return { eventId, mission, city, subcategory, missionName: target.missionName };
 }
 
 function json(res, statusCode, body) {
@@ -471,16 +457,13 @@ const VPS_SIGNAL_TARGETS = Object.freeze({
   nld: Object.freeze({ missionName: "Netherlands", cities: new Set(["NER", "NTTG"]) }),
 });
 
-function buildSlotAlertMessage({ missionName, city, subcategory, test = false }) {
+function buildSlotAlertMessage({ missionName, city, subcategory }) {
   const flag     = MISSION_FLAGS[missionName] || "🌍";
   const cityName = CITY_NAMES[city] || city || "Unknown";
   const time     = formatMoroccoTimestamp(new Date());
-  const headline = test
-    ? "🧪 *SLOTHAWK TEST SIGNAL — NO SLOT CONFIRMED*"
-    : "🦅 *SLOTHAWK SPOTTED A SLOT* 🦅";
 
   return [
-    headline,
+    "🦅 *SLOTHAWK SPOTTED A SLOT* 🦅",
     "▬▬▬▬▬▬▬▬▬▬▬▬▬▬",
     `PAYS: ${escapeMarkdownV2(missionName)} ${flag}`,
     `TYPE: ${escapeMarkdownV2(subcategory)}`,
@@ -1019,57 +1002,6 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // ── POST /admin/signals/test ─────────────────────────────────────────────
-  // Fixed test-only path: Malta / Casablanca / Business. It deliberately
-  // accepts no body and is invisible until SIGNAL_TEST_KEY is configured.
-  if (req.method === "POST" && url === "/admin/signals/test") {
-    const suppliedTestKey = req.headers["x-slothawk-test-key"];
-    if (!SIGNAL_TEST_ENABLED || !equalTextConstantTime(SIGNAL_TEST_KEY, suppliedTestKey)) {
-      return json(res, 404, { ok: false, error: "Not found" });
-    }
-    if (!TELEGRAM_ENABLED) {
-      return json(res, 503, { ok: false, error: "telegram_disabled" });
-    }
-    if (Date.now() - lastSignalTestAt < SIGNAL_TEST_COOLDOWN_MS) {
-      return json(res, 429, { ok: false, error: "test_cooldown" });
-    }
-
-    const testEvent = {
-      mission: "mlt",
-      city: "MLMCS",
-      subcategory: "Business",
-      missionName: "Malta",
-      test: true,
-    };
-    lastSignalTestAt = Date.now();
-
-    const message = buildSlotAlertMessage(testEvent);
-    let telegramResult;
-    if (TELEGRAM_PRO_CHAT_ID) {
-      telegramResult = await sendTelegramToChat(TELEGRAM_PRO_CHAT_ID, message, "DIRECT-TEST-PRO");
-      if (telegramResult.ok) scheduleLegacyTelegramSend(message, "direct-test");
-    } else if (TELEGRAM_CHAT_ID) {
-      telegramResult = await sendTelegramToChat(TELEGRAM_CHAT_ID, message, "DIRECT-TEST-LEGACY");
-    } else {
-      telegramResult = { ok: false, error: "no_channels_configured" };
-    }
-
-    if (!telegramResult.ok) {
-      lastSignalTestAt = 0;
-      return json(res, 502, { ok: false, error: "telegram_error" });
-    }
-
-    // Telegram was accepted first; now wake only exact matching profiles.
-    const signalResult = broadcastServerSlotFound(testEvent);
-    console.log(`[DIRECT TEST] Malta/MLMCS/Business; recipients=${signalResult.recipients}`);
-    return json(res, 200, {
-      ok: true,
-      test: true,
-      telegramSent: true,
-      signalRecipients: signalResult.recipients,
-    });
-  }
-
   // ── POST /v1/signals/vps ─────────────────────────────────────────────────
   // Trusted VPS ingress. Requests are HMAC-signed over the exact raw JSON body,
   // timestamp-bound, rate-limited, destination-allowlisted and deduplicated.
@@ -1127,7 +1059,6 @@ const server = http.createServer(async (req, res) => {
       missionName: event.missionName,
       city: event.city,
       subcategory: event.subcategory,
-      test: event.test,
     });
 
     let telegramResult;
