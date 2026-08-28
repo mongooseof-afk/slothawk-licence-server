@@ -89,6 +89,21 @@ function checkSignalRateLimit(key) {
   return true;
 }
 
+function disconnectSignalDevice(licenceKey, machineId) {
+  for (const room of signalRooms.values()) {
+    for (const peer of room) {
+      if (peer.signalLicenceKey === licenceKey && peer.signalMachineId === machineId) peer.close(4005, "device_removed");
+    }
+  }
+}
+
+function disconnectSignalLicence(licenceKey) {
+  for (const room of signalRooms.values()) {
+    for (const peer of room) {
+      if (peer.signalLicenceKey === licenceKey) peer.close(4006, "licence_disabled");
+    }
+  }
+}
 function leaveSignalRoom(ws) {
   const channel = ws.signalChannel;
   if (!channel) return;
@@ -133,14 +148,15 @@ async function authenticateSignalToken(token) {
   const licenceKey = decoded.license_key;
   if (!licenceKey) return null;
   const { rows } = await pool.query(
-    `SELECT status, expires_at, deactivated, blocked FROM licences WHERE license_key = $1`,
+    `SELECT status, expires_at, deactivated, blocked, active, machine_id, known_devices, max_devices FROM licences WHERE license_key = $1`,
     [licenceKey]
   );
   const licence = rows[0];
   if (!licence || licence.deactivated || licence.blocked ||
       licence.status !== "active" ||
       (licence.expires_at && new Date() > new Date(licence.expires_at))) return null;
-  return { licenceKey };
+  if (!isDeviceAllowed(licence, decoded.machine_id)) return null;
+  return { licenceKey, machineId: decoded.machine_id };
 }
 
 function checkAlertRateLimit(key) {
@@ -224,12 +240,14 @@ async function initDB() {
       heartbeat_history  JSONB NOT NULL DEFAULT '[]',
       activation_history JSONB NOT NULL DEFAULT '[]',
       sessions           JSONB NOT NULL DEFAULT '[]',
-      booking_events     JSONB NOT NULL DEFAULT '[]'
+      booking_events     JSONB NOT NULL DEFAULT '[]',
+      max_devices        INTEGER NOT NULL DEFAULT 1
     )
   `);
   // Existing Render databases may predate booking_events. CREATE TABLE IF
   // NOT EXISTS does not add new columns to an already-created table.
   await pool.query(`ALTER TABLE licences ADD COLUMN IF NOT EXISTS booking_events JSONB NOT NULL DEFAULT '[]'::jsonb`);
+  await pool.query(`ALTER TABLE licences ADD COLUMN IF NOT EXISTS max_devices INTEGER NOT NULL DEFAULT 1`);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS vps_signal_events (
       event_id UUID PRIMARY KEY,
@@ -353,12 +371,86 @@ function normalizeVpsSignal(body) {
   return { eventId, mission, city, subcategory, missionName: target.missionName };
 }
 
+const DEVICE_LIMIT_MIN = 1;
+const DEVICE_LIMIT_MAX = 50;
+
+function normalizeDeviceId(value) {
+  const id = String(value || "").trim();
+  return /^[A-Za-z0-9_-]{16,128}$/.test(id) ? id : "";
+}
+
+function normaliseDeviceLimit(value) {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed >= DEVICE_LIMIT_MIN && parsed <= DEVICE_LIMIT_MAX
+    ? parsed
+    : DEVICE_LIMIT_MIN;
+}
+
+function parseRequestedDeviceLimit(value) {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed >= DEVICE_LIMIT_MIN && parsed <= DEVICE_LIMIT_MAX
+    ? parsed
+    : null;
+}
+
+function normaliseKnownDevices(value) {
+  const source = Array.isArray(value) ? value : [];
+  const byMachine = new Map();
+  for (const item of source) {
+    const machineId = normalizeDeviceId(item?.machineId || item?.machine_id);
+    if (!machineId || byMachine.has(machineId)) continue;
+    byMachine.set(machineId, {
+      machineId,
+      ip: typeof item?.ip === "string" ? item.ip.slice(0, 128) : null,
+      firstSeenAt: typeof item?.firstSeenAt === "string" ? item.firstSeenAt : null,
+      browserInfo: item?.browserInfo && typeof item.browserInfo === "object" ? item.browserInfo : null,
+      active: item?.active !== false && !item?.removedAt,
+      removedAt: typeof item?.removedAt === "string" ? item.removedAt : null,
+    });
+  }
+  return Array.from(byMachine.values());
+}
+
+function activeDevices(value) {
+  return normaliseKnownDevices(value).filter((device) => device.active && !device.removedAt);
+}
+
+function isDeviceAllowed(licence, machineId) {
+  const id = normalizeDeviceId(machineId);
+  if (!id || !licence) return false;
+  const devices = normaliseKnownDevices(licence.known_devices);
+  const known = devices.find((device) => device.machineId === id);
+  if (known) return known.active && !known.removedAt;
+  return devices.length === 0 && String(licence.machine_id || "") === id;
+}
+
+function licenceStatusReason(licence) {
+  if (!licence) return "invalid";
+  if (licence.deactivated || licence.status === "revoked" || licence.status === "deactivated") return "revoked";
+  if (licence.blocked) return "machine_blocked";
+  if (licence.expires_at && new Date() > new Date(licence.expires_at)) return "expired";
+  if (licence.status !== "pending" && licence.status !== "active") return "licence_inactive";
+  return "";
+}
+
+function upsertActiveDevice(value, machineId, ip, browserInfo, nowIso) {
+  const id = normalizeDeviceId(machineId);
+  const devices = normaliseKnownDevices(value);
+  const index = devices.findIndex((device) => device.machineId === id);
+  if (index >= 0) {
+    if (!devices[index].active || devices[index].removedAt) return { ok: false, devices };
+    devices[index] = { ...devices[index], ip, browserInfo, active: true };
+    return { ok: true, devices };
+  }
+  devices.push({ machineId: id, ip, firstSeenAt: nowIso, browserInfo, active: true, removedAt: null });
+  return { ok: true, devices };
+}
 function json(res, statusCode, body) {
   res.writeHead(statusCode, {
     "Content-Type": "application/json",
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, PATCH, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization, X-API-Key",
   });
   res.end(JSON.stringify(body));
 }
@@ -390,6 +482,8 @@ function extractIdFromUrl(url) {
 
 function mapRow(r) {
   if (!r) return null;
+  const knownDevices = normaliseKnownDevices(r.known_devices);
+  const activeDeviceCount = activeDevices(knownDevices).length;
   return {
     id: r.id,
     key: r.license_key, licenseKey: r.license_key, licenceKey: r.license_key, license_key: r.license_key,
@@ -407,7 +501,9 @@ function mapRow(r) {
     deactivated: r.deactivated || false, blocked: r.blocked || false,
     suspicious: r.suspicious || false,
     suspiciousReason: r.suspicious_reason, suspicious_reason: r.suspicious_reason,
-    knownDevices: r.known_devices || [], known_devices: r.known_devices || [],
+    knownDevices, known_devices: knownDevices,
+    maxDevices: normaliseDeviceLimit(r.max_devices), max_devices: normaliseDeviceLimit(r.max_devices),
+    activeDeviceCount, active_device_count: activeDeviceCount,
     heartbeatHistory: r.heartbeat_history || [], heartbeat_history: r.heartbeat_history || [],
     activationHistory: r.activation_history || [], activation_history: r.activation_history || [],
     sessions: r.sessions || [],
@@ -529,7 +625,7 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(204, {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, POST, PATCH, DELETE, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization, X-API-Key",
     });
     return res.end();
   }
@@ -558,14 +654,16 @@ const server = http.createServer(async (req, res) => {
     const duration = parseInt(body.duration_days || body.duration) || 30;
     const username = body.username || "";
     const plan     = body.plan || "standard";
+    const requestedMaxDevices = parseRequestedDeviceLimit(body.maxDevices ?? body.max_devices ?? 1);
+    if (requestedMaxDevices === null) return json(res, 400, { ok: false, error: "maxDevices must be an integer between 1 and 50" });
     const key      = generateLicenceKey();
     const id       = uuidv4();
     const expiresAt = new Date();
     expiresAt.setDate(expiresAt.getDate() + duration);
     try {
       const { rows } = await pool.query(
-        `INSERT INTO licences (id, license_key, username, plan, status, duration, expires_at) VALUES ($1, $2, $3, $4, 'pending', $5, $6) RETURNING *`,
-        [id, key, username, plan, duration, expiresAt]
+        `INSERT INTO licences (id, license_key, username, plan, status, duration, expires_at, max_devices) VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7) RETURNING *`,
+        [id, key, username, plan, duration, expiresAt, requestedMaxDevices]
       );
       console.log(`[GENERATE] key=${key}`);
       return json(res, 200, { ok: true, key, license_key: key, id, duration_days: duration, licences: [mapRow(rows[0])] });
@@ -586,11 +684,65 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  // ── PATCH /admin/licences/:id/device-limit ─────────────────────────────
+  if (req.method === "PATCH" && url.endsWith("/device-limit")) {
+    const id = extractIdFromUrl(url);
+    const body = await readBody(req);
+    const requestedMaxDevices = parseRequestedDeviceLimit(body.maxDevices ?? body.max_devices);
+    if (requestedMaxDevices === null) return json(res, 400, { ok: false, error: "maxDevices must be an integer between 1 and 50" });
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const locked = await client.query(`SELECT * FROM licences WHERE id = $1 OR license_key = $1 FOR UPDATE`, [id]);
+      const licence = locked.rows[0];
+      if (!licence) { await client.query("ROLLBACK"); return json(res, 404, { ok: false, error: "Licence not found" }); }
+      const devices = activeDevices(licence.known_devices);
+      if (requestedMaxDevices < devices.length) {
+        await client.query("ROLLBACK");
+        return json(res, 409, { ok: false, error: "Device limit cannot be below the number of active devices" });
+      }
+      const updated = await client.query(`UPDATE licences SET max_devices = $1 WHERE id = $2 RETURNING *`, [requestedMaxDevices, licence.id]);
+      await client.query("COMMIT");
+      return json(res, 200, { ok: true, licence: mapRow(updated.rows[0]) });
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
+      return json(res, 500, { ok: false, error: "DB error" });
+    } finally { client.release(); }
+  }
+
+  // ── PATCH /admin/licences/:id/devices/remove ────────────────────────────
+  if (req.method === "PATCH" && url.endsWith("/devices/remove")) {
+    const parts = url.split("/").filter(Boolean);
+    const deviceIndex = parts.lastIndexOf("devices");
+    const id = deviceIndex > 0 ? parts[deviceIndex - 1] : "";
+    const body = await readBody(req);
+    const machineId = normalizeDeviceId(body.machineId);
+    if (!id || !machineId) return json(res, 400, { ok: false, error: "Invalid device" });
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const locked = await client.query(`SELECT * FROM licences WHERE id = $1 OR license_key = $1 FOR UPDATE`, [id]);
+      const licence = locked.rows[0];
+      if (!licence) { await client.query("ROLLBACK"); return json(res, 404, { ok: false, error: "Licence not found" }); }
+      const devices = normaliseKnownDevices(licence.known_devices);
+      const index = devices.findIndex((device) => device.machineId === machineId && device.active && !device.removedAt);
+      if (index < 0) { await client.query("ROLLBACK"); return json(res, 404, { ok: false, error: "Active device not found" }); }
+      devices[index] = { ...devices[index], active: false, removedAt: new Date().toISOString() };
+      const updated = await client.query(`UPDATE licences SET known_devices = $1 WHERE id = $2 RETURNING *`, [JSON.stringify(devices), licence.id]);
+      await client.query("COMMIT");
+      disconnectSignalDevice(licence.license_key, machineId);
+      return json(res, 200, { ok: true, licence: mapRow(updated.rows[0]) });
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
+      return json(res, 500, { ok: false, error: "DB error" });
+    } finally { client.release(); }
+  }
   // ── PATCH /admin/licences/:id/revoke ──────────────────────────────────────
   if (req.method === "PATCH" && url.includes("/revoke")) {
     const id = extractIdFromUrl(url);
     try {
-      const result = await pool.query(`UPDATE licences SET status = 'revoked', active = FALSE WHERE id = $1 OR license_key = $1`, [id]);
+      const result = await pool.query(`UPDATE licences SET status = 'revoked', active = FALSE, blocked = TRUE WHERE id = $1 OR license_key = $1 RETURNING license_key`, [id]);
+      for (const licence of result.rows) disconnectSignalLicence(licence.license_key);
       console.log(`[REVOKE] id=${id} rows=${result.rowCount}`);
       return json(res, 200, { ok: true });
     } catch (err) { return json(res, 500, { ok: false, error: err.message }); }
@@ -600,7 +752,8 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "PATCH" && url.includes("/reset-machine")) {
     const id = extractIdFromUrl(url);
     try {
-      const result = await pool.query(`UPDATE licences SET machine_id = NULL, status = 'pending', blocked = FALSE, suspicious = FALSE, suspicious_reason = NULL, known_devices = '[]' WHERE id = $1 OR license_key = $1`, [id]);
+      const result = await pool.query(`UPDATE licences SET machine_id = NULL, status = 'pending', active = FALSE, blocked = FALSE, suspicious = FALSE, suspicious_reason = NULL, known_devices = '[]' WHERE id = $1 OR license_key = $1 RETURNING license_key`, [id]);
+      for (const licence of result.rows) disconnectSignalLicence(licence.license_key);
       console.log(`[RESET-MACHINE] id=${id} rows=${result.rowCount}`);
       return json(res, 200, { ok: true });
     } catch (err) { return json(res, 500, { ok: false, error: err.message }); }
@@ -620,7 +773,8 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "PATCH" && url.includes("/deactivate")) {
     const id = extractIdFromUrl(url);
     try {
-      const result = await pool.query(`UPDATE licences SET status = 'deactivated', deactivated = TRUE, machine_id = NULL WHERE id = $1 OR license_key = $1`, [id]);
+      const result = await pool.query(`UPDATE licences SET status = 'deactivated', active = FALSE, deactivated = TRUE WHERE id = $1 OR license_key = $1 RETURNING license_key`, [id]);
+      for (const licence of result.rows) disconnectSignalLicence(licence.license_key);
       console.log(`[DEACTIVATE] id=${id} rows=${result.rowCount}`);
       return json(res, 200, { ok: true });
     } catch (err) { return json(res, 500, { ok: false, error: err.message }); }
@@ -694,16 +848,19 @@ const server = http.createServer(async (req, res) => {
 
   // ── POST /generate-licence (legacy) ───────────────────────────────────────
   if (req.method === "POST" && url === "/generate-licence") {
+    if (!hasValidDashboardApiKey(req)) return json(res, 401, { ok: false, error: "Unauthorized" });
     const body     = await readBody(req);
     const duration = parseInt(body.duration_days) || 30;
+    const requestedMaxDevices = parseRequestedDeviceLimit(body.maxDevices ?? body.max_devices ?? 1);
+    if (requestedMaxDevices === null) return json(res, 400, { ok: false, error: "maxDevices must be an integer between 1 and 50" });
     const key      = generateLicenceKey();
     const id       = uuidv4();
     const expiresAt = new Date();
     expiresAt.setDate(expiresAt.getDate() + duration);
     try {
       await pool.query(
-        `INSERT INTO licences (id, license_key, status, duration, expires_at) VALUES ($1, $2, 'pending', $3, $4)`,
-        [id, key, duration, expiresAt]
+        `INSERT INTO licences (id, license_key, status, duration, expires_at, max_devices) VALUES ($1, $2, 'pending', $3, $4, $5)`,
+        [id, key, duration, expiresAt, requestedMaxDevices]
       );
       return json(res, 200, { ok: true, key, duration_days: duration });
     } catch (err) {
@@ -719,82 +876,69 @@ const server = http.createServer(async (req, res) => {
     const ip         = getClientIp(req);
 
     if (!key) return json(res, 400, { ok: false, error: "Missing key" });
+    if (!normalizeDeviceId(machine_id)) return json(res, 200, { ok: false, reason: "invalid_device" });
 
+    const client = await pool.connect();
     try {
-      const { rows } = await pool.query(`SELECT * FROM licences WHERE license_key = $1`, [key]);
-      if (!rows.length) return json(res, 200, { ok: false, reason: "invalid" });
+      await client.query("BEGIN");
+      const lockedResult = await client.query(`SELECT * FROM licences WHERE license_key = $1 FOR UPDATE`, [key]);
+      const licence = lockedResult.rows[0];
+      if (!licence) { await client.query("ROLLBACK"); return json(res, 200, { ok: false, reason: "invalid" }); }
 
-      const licence = rows[0];
+      const stateReason = licenceStatusReason(licence);
+      if (stateReason) { await client.query("ROLLBACK"); return json(res, 200, { ok: false, reason: stateReason }); }
 
-      if (licence.deactivated || licence.status === "revoked" || licence.status === "deactivated")
-        return json(res, 200, { ok: false, reason: "revoked" });
-      if (licence.blocked)
-        return json(res, 200, { ok: false, reason: "machine_blocked" });
-      if (licence.expires_at && new Date() > new Date(licence.expires_at))
-        return json(res, 200, { ok: false, reason: "expired" });
-
-      // ── DUPLICATE MACHINE → AUTO-REVOKE ALL ───────────────────────
-      if (licence.machine_id && machine_id && licence.machine_id !== machine_id) {
-        await pool.query(
-          `UPDATE licences SET
-            status = 'revoked', active = FALSE, blocked = TRUE,
-            suspicious = TRUE, suspicious_reason = $1
-           WHERE license_key = $2`,
-          [`Auto-revoked: duplicate machine attempt. Original: ${licence.machine_id}, Attacker: ${machine_id}, IP: ${ip}`, key]
-        );
-        console.log(`[AUTO-REVOKE] key=${key} original=${licence.machine_id} attacker=${machine_id} ip=${ip}`);
-        return json(res, 200, { ok: false, reason: "revoked" });
-      }
-
+      const deviceId = normalizeDeviceId(machine_id);
       const now = new Date();
-      const expiresAt = licence.expires_at || (() => { const d = new Date(now); d.setDate(d.getDate() + licence.duration); return d; })();
-
-      const devices = licence.known_devices || [];
-      const alreadyKnown = devices.some(d => d.machineId === machine_id && d.ip === ip);
-      if (!alreadyKnown && machine_id) {
-        devices.push({ machineId: machine_id, ip: ip, firstSeenAt: now.toISOString() });
+      const nowIso = now.toISOString();
+      const devices = normaliseKnownDevices(licence.known_devices);
+      const existingDevice = devices.find((device) => device.machineId === deviceId);
+      if (existingDevice && (!existingDevice.active || existingDevice.removedAt)) {
+        await client.query("ROLLBACK");
+        return json(res, 200, { ok: false, reason: "device_removed" });
+      }
+      if (!existingDevice && activeDevices(devices).length >= normaliseDeviceLimit(licence.max_devices)) {
+        await client.query("ROLLBACK");
+        return json(res, 200, { ok: false, reason: "device_limit_reached" });
       }
 
-      const actHistory = licence.activation_history || [];
-      actHistory.unshift({
-        id: uuidv4(),
-        machineId: machine_id,
-        ip: ip,
-        version: (body.browser_info || {}).extension_version || '',
-        createdAt: now.toISOString(),
-      });
+      const deviceUpdate = upsertActiveDevice(devices, deviceId, ip, body.browser_info || null, nowIso);
+      if (!deviceUpdate.ok) { await client.query("ROLLBACK"); return json(res, 200, { ok: false, reason: "device_removed" }); }
+
+      const expiresAt = licence.expires_at || (() => { const d = new Date(now); d.setDate(d.getDate() + licence.duration); return d; })();
+      const actHistory = Array.isArray(licence.activation_history) ? licence.activation_history : [];
+      actHistory.unshift({ id: uuidv4(), machineId: deviceId, ip, version: (body.browser_info || {}).extension_version || "", createdAt: nowIso });
       if (actHistory.length > 20) actHistory.length = 20;
 
-      await pool.query(
-        `UPDATE licences SET
-          status = 'active',
-          machine_id = COALESCE(machine_id, $1),
-          activated_at = COALESCE(activated_at, $2),
-          expires_at = COALESCE(expires_at, $3),
-          last_seen = $4,
-          first_ip = COALESCE(first_ip, $5),
-          last_ip = $5,
-          known_devices = $6,
-          activation_history = $7
-         WHERE license_key = $8`,
-        [machine_id || null, now, expiresAt, now, ip, JSON.stringify(devices), JSON.stringify(actHistory), key]
+      await client.query(
+`UPDATE licences SET
+        status = 'active', active = TRUE,
+        machine_id = COALESCE(machine_id, $1),
+        activated_at = COALESCE(activated_at, $2),
+        expires_at = COALESCE(expires_at, $3),
+        last_seen = $2,
+        first_ip = COALESCE(first_ip, $4),
+        last_ip = $4,
+        known_devices = $5,
+        activation_history = $6
+       WHERE license_key = $7`,
+        [deviceId, now, expiresAt, ip, JSON.stringify(deviceUpdate.devices), JSON.stringify(actHistory), key]
       );
 
+      await client.query("COMMIT");
       const token = jwt.sign(
-        { license_key: key, machine_id, expires_at: expiresAt instanceof Date ? expiresAt.toISOString() : expiresAt },
+        { license_key: key, machine_id: deviceId, expires_at: expiresAt instanceof Date ? expiresAt.toISOString() : expiresAt },
         JWT_SECRET,
         { expiresIn: JWT_EXPIRES }
       );
-
-      console.log(`[ACTIVATE] OK key=${key} machine=${machine_id}`);
+      console.log("[ACTIVATE] OK key=" + key + " device=" + deviceId.slice(0, 12));
       return json(res, 200, { ok: true, token, expiresAt: expiresAt instanceof Date ? expiresAt.toISOString() : expiresAt });
-
     } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
       console.error("[ACTIVATE] error:", err.message);
       return json(res, 500, { ok: false, error: "DB error" });
-    }
+    } finally { client.release(); }
   }
-
   // ── POST /validate-licence ────────────────────────────────────────────────
   if (req.method === "POST" && url === "/validate-licence") {
     const body  = await readBody(req);
@@ -809,7 +953,7 @@ const server = http.createServer(async (req, res) => {
         return json(res, 200, { ok: false, reason: "key_mismatch" });
 
       const { rows } = await pool.query(
-        `SELECT status, expires_at, deactivated, blocked FROM licences WHERE license_key = $1`,
+        `SELECT status, expires_at, deactivated, blocked, active, machine_id, known_devices, max_devices FROM licences WHERE license_key = $1`,
         [decoded.license_key]
       );
 
@@ -819,6 +963,7 @@ const server = http.createServer(async (req, res) => {
       if (l.blocked) return json(res, 200, { ok: false, reason: "machine_blocked" });
       if (l.status !== "active") return json(res, 200, { ok: false, reason: "licence_inactive" });
       if (l.expires_at && new Date() > new Date(l.expires_at)) return json(res, 200, { ok: false, reason: "licence_expired" });
+      if (!isDeviceAllowed(l, decoded.machine_id)) return json(res, 200, { ok: false, reason: "device_removed" });
 
       return json(res, 200, { ok: true, expiresAt: l.expires_at });
     } catch {
@@ -842,7 +987,7 @@ const server = http.createServer(async (req, res) => {
       if (decoded.machine_id !== machine_id) return json(res, 200, { ok: false, reason: "machine_blocked" });
 
       const { rows } = await pool.query(
-        `SELECT status, expires_at, deactivated, blocked FROM licences WHERE license_key = $1`,
+        `SELECT status, expires_at, deactivated, blocked, active, machine_id, known_devices, max_devices FROM licences WHERE license_key = $1`,
         [decoded.license_key]
       );
 
@@ -851,6 +996,7 @@ const server = http.createServer(async (req, res) => {
       if (l.deactivated || l.status === "revoked" || l.status === "deactivated") return json(res, 200, { ok: false, reason: "revoked" });
       if (l.status !== "active") return json(res, 200, { ok: false, reason: "licence_inactive" });
       if (l.expires_at && new Date() > new Date(l.expires_at)) return json(res, 200, { ok: false, reason: "licence_expired" });
+      if (!isDeviceAllowed(l, machine_id)) return json(res, 200, { ok: false, reason: "device_removed" });
 
       const newToken = jwt.sign(
         { license_key: decoded.license_key, machine_id, expires_at: l.expires_at },
@@ -867,11 +1013,13 @@ const server = http.createServer(async (req, res) => {
 
   // ── POST /revoke-licence ──────────────────────────────────────────────────
   if (req.method === "POST" && url === "/revoke-licence") {
+    if (!hasValidDashboardApiKey(req)) return json(res, 401, { ok: false, error: "Unauthorized" });
     const body = await readBody(req);
     const key  = (body.key || "").trim().toUpperCase();
     if (!key) return json(res, 400, { ok: false, error: "Missing key" });
     try {
-      await pool.query(`UPDATE licences SET status = 'revoked', active = FALSE WHERE license_key = $1`, [key]);
+      const result = await pool.query(`UPDATE licences SET status = 'revoked', active = FALSE, blocked = TRUE WHERE license_key = $1 RETURNING license_key`, [key]);
+      for (const licence of result.rows) disconnectSignalLicence(licence.license_key);
       return json(res, 200, { ok: true });
     } catch (err) { return json(res, 500, { ok: false, error: "DB error" }); }
   }
@@ -900,6 +1048,7 @@ const server = http.createServer(async (req, res) => {
       if (licence.blocked) return json(res, 200, { ok: false, reason: "machine_blocked" });
       if (licence.status !== "active") return json(res, 200, { ok: false, reason: "licence_inactive" });
       if (licence.expires_at && new Date() > new Date(licence.expires_at)) return json(res, 200, { ok: false, reason: "licence_expired" });
+      if (!isDeviceAllowed(licence, machine_id)) return json(res, 200, { ok: false, reason: "device_removed" });
 
       const now = new Date();
 
@@ -970,7 +1119,7 @@ const server = http.createServer(async (req, res) => {
     try {
       const decoded = jwt.verify(token, JWT_SECRET);
       const { rows } = await pool.query(
-        `SELECT status, expires_at, deactivated, blocked, booking_events FROM licences WHERE license_key = $1`,
+        `SELECT status, expires_at, deactivated, blocked, active, machine_id, known_devices, max_devices, booking_events FROM licences WHERE license_key = $1`,
         [decoded.license_key]
       );
       const licence = rows[0];
@@ -978,6 +1127,7 @@ const server = http.createServer(async (req, res) => {
           (licence.expires_at && new Date() > new Date(licence.expires_at))) {
         return json(res, 403, { ok: false, reason: "licence_inactive" });
       }
+      if (!isDeviceAllowed(licence, decoded.machine_id)) return json(res, 403, { ok: false, reason: "device_removed" });
 
       const events = Array.isArray(licence.booking_events) ? licence.booking_events : [];
       const event = {
@@ -1123,7 +1273,7 @@ const server = http.createServer(async (req, res) => {
     // 2. Check licence status (same rules as /heartbeat)
     try {
       const { rows } = await pool.query(
-        `SELECT status, expires_at, deactivated, blocked FROM licences WHERE license_key = $1`,
+        `SELECT status, expires_at, deactivated, blocked, active, machine_id, known_devices, max_devices FROM licences WHERE license_key = $1`,
         [licenceKey]
       );
       if (!rows.length) return json(res, 403, { ok: false, reason: "invalid_licence" });
@@ -1136,6 +1286,7 @@ const server = http.createServer(async (req, res) => {
       if (l.expires_at && new Date() > new Date(l.expires_at)) {
         return json(res, 403, { ok: false, reason: "licence_expired" });
       }
+      if (!isDeviceAllowed(l, decoded.machine_id)) return json(res, 403, { ok: false, reason: "device_removed" });
     } catch (err) {
       console.error("[ALERT] DB error:", err.message);
       return json(res, 500, { ok: false, reason: "db_error" });
@@ -1231,6 +1382,7 @@ signalWss.on("connection", (ws) => {
   ws.signalAuthorised = false;
   ws.signalChannel = "";
   ws.signalLicenceKey = "";
+  ws.signalMachineId = "";
 
   const authTimer = setTimeout(() => {
     if (!ws.signalAuthorised) ws.close(4001, "auth_timeout");
@@ -1255,6 +1407,7 @@ signalWss.on("connection", (ws) => {
       clearTimeout(authTimer);
       ws.signalAuthorised = true;
       ws.signalLicenceKey = identity.licenceKey;
+      ws.signalMachineId = identity.machineId;
       ws.signalChannel = channel;
       if (!signalRooms.has(channel)) signalRooms.set(channel, new Set());
       signalRooms.get(channel).add(ws);
