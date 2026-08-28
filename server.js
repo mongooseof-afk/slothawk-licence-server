@@ -148,7 +148,7 @@ async function authenticateSignalToken(token) {
   const licenceKey = decoded.license_key;
   if (!licenceKey) return null;
   const { rows } = await pool.query(
-    `SELECT status, expires_at, deactivated, blocked, active, machine_id, known_devices, max_devices FROM licences WHERE license_key = $1`,
+    `SELECT status, expires_at, deactivated, blocked, active, machine_id, known_devices, max_devices, username FROM licences WHERE license_key = $1`,
     [licenceKey]
   );
   const licence = rows[0];
@@ -1017,12 +1017,12 @@ const server = http.createServer(async (req, res) => {
 
       await client.query("COMMIT");
       const token = jwt.sign(
-        { license_key: key, machine_id: deviceId, expires_at: expiresAt instanceof Date ? expiresAt.toISOString() : expiresAt },
+        { license_key: key, machine_id: deviceId, username: licence.username || "", expires_at: expiresAt instanceof Date ? expiresAt.toISOString() : expiresAt },
         JWT_SECRET,
         { expiresIn: JWT_EXPIRES }
       );
       console.log("[ACTIVATE] OK key=" + key + " device=" + deviceId.slice(0, 12));
-      return json(res, 200, { ok: true, token, expiresAt: expiresAt instanceof Date ? expiresAt.toISOString() : expiresAt });
+      return json(res, 200, { ok: true, token, username: licence.username || "", expiresAt: expiresAt instanceof Date ? expiresAt.toISOString() : expiresAt });
     } catch (err) {
       await client.query("ROLLBACK").catch(() => {});
       console.error("[ACTIVATE] error:", err.message);
@@ -1043,7 +1043,7 @@ const server = http.createServer(async (req, res) => {
         return json(res, 200, { ok: false, reason: "key_mismatch" });
 
       const { rows } = await pool.query(
-        `SELECT status, expires_at, deactivated, blocked, active, machine_id, known_devices, max_devices FROM licences WHERE license_key = $1`,
+        `SELECT status, expires_at, deactivated, blocked, active, machine_id, known_devices, max_devices, username FROM licences WHERE license_key = $1`,
         [decoded.license_key]
       );
 
@@ -1055,7 +1055,7 @@ const server = http.createServer(async (req, res) => {
       if (l.expires_at && new Date() > new Date(l.expires_at)) return json(res, 200, { ok: false, reason: "licence_expired" });
       if (!isDeviceAllowed(l, decoded.machine_id)) return json(res, 200, { ok: false, reason: "device_removed" });
 
-      return json(res, 200, { ok: true, expiresAt: l.expires_at });
+      return json(res, 200, { ok: true, username: l.username || "", expiresAt: l.expires_at });
     } catch {
       return json(res, 200, { ok: false, reason: "invalid_token" });
     }
@@ -1077,7 +1077,7 @@ const server = http.createServer(async (req, res) => {
       if (decoded.machine_id !== machine_id) return json(res, 200, { ok: false, reason: "machine_blocked" });
 
       const { rows } = await pool.query(
-        `SELECT status, expires_at, deactivated, blocked, active, machine_id, known_devices, max_devices FROM licences WHERE license_key = $1`,
+        `SELECT status, expires_at, deactivated, blocked, active, machine_id, known_devices, max_devices, username FROM licences WHERE license_key = $1`,
         [decoded.license_key]
       );
 
@@ -1089,13 +1089,13 @@ const server = http.createServer(async (req, res) => {
       if (!isDeviceAllowed(l, machine_id)) return json(res, 200, { ok: false, reason: "device_removed" });
 
       const newToken = jwt.sign(
-        { license_key: decoded.license_key, machine_id, expires_at: l.expires_at },
+        { license_key: decoded.license_key, machine_id, username: l.username || "", expires_at: l.expires_at },
         JWT_SECRET,
         { expiresIn: JWT_EXPIRES }
       );
 
       await pool.query(`UPDATE licences SET last_seen = NOW() WHERE license_key = $1`, [decoded.license_key]);
-      return json(res, 200, { ok: true, token: newToken });
+      return json(res, 200, { ok: true, token: newToken, username: l.username || "" });
     } catch (err) {
       return json(res, 500, { ok: false, error: "DB error" });
     }
@@ -1375,7 +1375,7 @@ const server = http.createServer(async (req, res) => {
     // 2. Check licence status (same rules as /heartbeat)
     try {
       const { rows } = await pool.query(
-        `SELECT status, expires_at, deactivated, blocked, active, machine_id, known_devices, max_devices FROM licences WHERE license_key = $1`,
+        `SELECT status, expires_at, deactivated, blocked, active, machine_id, known_devices, max_devices, username FROM licences WHERE license_key = $1`,
         [licenceKey]
       );
       if (!rows.length) return json(res, 403, { ok: false, reason: "invalid_licence" });
