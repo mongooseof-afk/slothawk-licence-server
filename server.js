@@ -482,8 +482,31 @@ function extractIdFromUrl(url) {
 
 function mapRow(r) {
   if (!r) return null;
+  const now = Date.now();
   const knownDevices = normaliseKnownDevices(r.known_devices);
   const activeDeviceCount = activeDevices(knownDevices).length;
+  const activeMachineIds = new Set(activeDevices(knownDevices).map((device) => device.machineId));
+  const legacyMachineId = normalizeDeviceId(r.machine_id);
+  if (activeMachineIds.size === 0 && legacyMachineId) activeMachineIds.add(legacyMachineId);
+
+  const onlineMachineIds = new Set(
+    (Array.isArray(r.sessions) ? r.sessions : [])
+      .filter((session) => {
+        const machineId = normalizeDeviceId(session?.machineId);
+        const lastPingAt = Date.parse(session?.lastPingAt || "");
+        return Boolean(
+          machineId &&
+          activeMachineIds.has(machineId) &&
+          !session?.endedAt &&
+          Number.isFinite(lastPingAt) &&
+          now - lastPingAt <= SESSION_GAP
+        );
+      })
+      .map((session) => normalizeDeviceId(session.machineId))
+      .filter(Boolean)
+  );
+  const onlineProfileCount = onlineMachineIds.size;
+
   return {
     id: r.id,
     key: r.license_key, licenseKey: r.license_key, licenceKey: r.license_key, license_key: r.license_key,
@@ -504,6 +527,7 @@ function mapRow(r) {
     knownDevices, known_devices: knownDevices,
     maxDevices: normaliseDeviceLimit(r.max_devices), max_devices: normaliseDeviceLimit(r.max_devices),
     activeDeviceCount, active_device_count: activeDeviceCount,
+    onlineProfileCount, online_profile_count: onlineProfileCount,
     heartbeatHistory: r.heartbeat_history || [], heartbeat_history: r.heartbeat_history || [],
     activationHistory: r.activation_history || [], activation_history: r.activation_history || [],
     sessions: r.sessions || [],
@@ -737,6 +761,72 @@ const server = http.createServer(async (req, res) => {
       return json(res, 500, { ok: false, error: "DB error" });
     } finally { client.release(); }
   }
+  // ── PATCH /admin/licences/:id/devices/restore ───────────────────────────
+  if (req.method === "PATCH" && url.endsWith("/devices/restore")) {
+    const parts = url.split("/").filter(Boolean);
+    const devicesIndex = parts.lastIndexOf("devices");
+    const id = devicesIndex > 0 ? parts[devicesIndex - 1] : "";
+    const body = await readBody(req);
+    const machineId = normalizeDeviceId(body.machineId);
+    if (!id || !machineId) return json(res, 400, { ok: false, error: "Invalid device" });
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const locked = await client.query(`SELECT * FROM licences WHERE id = $1 OR license_key = $1 FOR UPDATE`, [id]);
+      const licence = locked.rows[0];
+      if (!licence) {
+        await client.query("ROLLBACK");
+        return json(res, 404, { ok: false, error: "Licence not found" });
+      }
+
+      const devices = normaliseKnownDevices(licence.known_devices);
+      const index = devices.findIndex((device) => device.machineId === machineId && (!device.active || device.removedAt));
+      if (index < 0) {
+        await client.query("ROLLBACK");
+        return json(res, 404, { ok: false, error: "Removed device not found" });
+      }
+
+      if (activeDevices(devices).length >= normaliseDeviceLimit(licence.max_devices)) {
+        await client.query("ROLLBACK");
+        return json(res, 409, { ok: false, error: "Device limit reached. Increase the limit before restoring this device." });
+      }
+
+      devices[index] = { ...devices[index], active: true, removedAt: null };
+      const updated = await client.query(
+        `UPDATE licences SET known_devices = $1 WHERE id = $2 RETURNING *`,
+        [JSON.stringify(devices), licence.id]
+      );
+      await client.query("COMMIT");
+      return json(res, 200, { ok: true, licence: mapRow(updated.rows[0]) });
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
+      return json(res, 500, { ok: false, error: "DB error" });
+    } finally {
+      client.release();
+    }
+  }
+
+  // ── PATCH /admin/licences/:id/username ────────────────────────────────────
+  if (req.method === "PATCH" && url.endsWith("/username")) {
+    const id = extractIdFromUrl(url);
+    const body = await readBody(req);
+    const username = typeof body.username === "string" ? body.username.trim().replace(/\s+/g, " ") : "";
+    if (!username || username.length > 60) {
+      return json(res, 400, { ok: false, error: "Username must be between 1 and 60 characters" });
+    }
+    try {
+      const result = await pool.query(
+        `UPDATE licences SET username = $1 WHERE id = $2 OR license_key = $2 RETURNING *`,
+        [username, id]
+      );
+      if (!result.rows.length) return json(res, 404, { ok: false, error: "Licence not found" });
+      return json(res, 200, { ok: true, licence: mapRow(result.rows[0]) });
+    } catch (err) {
+      return json(res, 500, { ok: false, error: "DB error" });
+    }
+  }
+
   // ── PATCH /admin/licences/:id/revoke ──────────────────────────────────────
   if (req.method === "PATCH" && url.includes("/revoke")) {
     const id = extractIdFromUrl(url);
@@ -1052,11 +1142,25 @@ const server = http.createServer(async (req, res) => {
 
       const now = new Date();
 
-      const sessions = licence.sessions || [];
-      const lastSession = sessions[0];
-      const gap = lastSession ? (now - new Date(lastSession.lastPingAt)) : Infinity;
+      const sessions = Array.isArray(licence.sessions) ? licence.sessions : [];
+      for (const session of sessions) {
+        const lastPingAt = Date.parse(session?.lastPingAt || "");
+        if (!session?.endedAt && (!Number.isFinite(lastPingAt) || now - lastPingAt > SESSION_GAP)) {
+          session.endedAt = session?.lastPingAt || now.toISOString();
+        }
+      }
 
-      if (gap > SESSION_GAP) {
+      const activeSession = sessions.find((session) => (
+        session?.machineId === machine_id &&
+        !session?.endedAt &&
+        Number.isFinite(Date.parse(session?.lastPingAt || "")) &&
+        now - Date.parse(session.lastPingAt) <= SESSION_GAP
+      ));
+
+      if (activeSession) {
+        activeSession.lastPingAt = now.toISOString();
+        activeSession.ip = ip;
+      } else {
         sessions.unshift({
           id: uuidv4(),
           startedAt: now.toISOString(),
@@ -1065,10 +1169,8 @@ const server = http.createServer(async (req, res) => {
           ip: ip,
           machineId: machine_id,
         });
-        if (sessions.length > 50) sessions.length = 50;
-      } else {
-        sessions[0].lastPingAt = now.toISOString();
       }
+      if (sessions.length > 50) sessions.length = 50;
 
       const hbHistory = licence.heartbeat_history || [];
       hbHistory.unshift({
