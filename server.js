@@ -15,6 +15,9 @@ const PORT        = parseInt(process.env.PORT) || 8765;
 const JWT_SECRET  = process.env.JWT_SECRET;
 const JWT_EXPIRES = process.env.JWT_EXPIRES_IN || "7d";
 const SESSION_GAP = 10 * 60 * 1000;
+// A panel that stopped reporting is no longer shown online quickly, while a
+// short grace period avoids flapping when Chrome throttles a background tab.
+const PANEL_SESSION_GAP = 3 * 60 * 1000;
 // Shared only with the Dashboard backend. Never ship this value to the
 // browser/extension: it protects all administrative licence operations.
 const DASHBOARD_API_KEY = process.env.DASHBOARD_API_KEY || "";
@@ -415,6 +418,31 @@ function activeDevices(value) {
   return normaliseKnownDevices(value).filter((device) => device.active && !device.removedAt);
 }
 
+// Profile sessions are display-only presence IDs, distinct from the signed
+// Windows device identity. They are accepted only after the JWT and device
+// checks in /heartbeat have passed and never affect max_devices.
+const PROFILE_SESSION_ID_RE = /^prf-[a-f0-9]{32}\.tab-[1-9][0-9]{0,9}$/i;
+const MAX_PROFILE_SESSIONS_PER_HEARTBEAT = 40;
+
+function normaliseProfileSessionIds(value) {
+  if (!Array.isArray(value)) return [];
+  const ids = [];
+  const seen = new Set();
+  for (const item of value) {
+    const id = String(item || "").trim().toLowerCase();
+    if (!PROFILE_SESSION_ID_RE.test(id) || seen.has(id)) continue;
+    seen.add(id);
+    ids.push(id);
+    if (ids.length >= MAX_PROFILE_SESSIONS_PER_HEARTBEAT) break;
+  }
+  return ids;
+}
+
+function sessionProfileId(session) {
+  const id = String(session?.profileSessionId || "").trim().toLowerCase();
+  return PROFILE_SESSION_ID_RE.test(id) ? id : "";
+}
+
 function isDeviceAllowed(licence, machineId) {
   const id = normalizeDeviceId(machineId);
   if (!id || !licence) return false;
@@ -625,23 +653,32 @@ function mapRow(r) {
   const legacyMachineId = normalizeDeviceId(r.machine_id);
   if (activeMachineIds.size === 0 && legacyMachineId) activeMachineIds.add(legacyMachineId);
 
-  const onlineMachineIds = new Set(
-    (Array.isArray(r.sessions) ? r.sessions : [])
-      .filter((session) => {
-        const machineId = normalizeDeviceId(session?.machineId);
-        const lastPingAt = Date.parse(session?.lastPingAt || "");
-        return Boolean(
-          machineId &&
-          activeMachineIds.has(machineId) &&
-          !session?.endedAt &&
-          Number.isFinite(lastPingAt) &&
-          now - lastPingAt <= SESSION_GAP
-        );
-      })
+  const onlineSessions = (Array.isArray(r.sessions) ? r.sessions : [])
+    .filter((session) => {
+      const machineId = normalizeDeviceId(session?.machineId);
+      const lastPingAt = Date.parse(session?.lastPingAt || "");
+      return Boolean(
+        machineId &&
+        activeMachineIds.has(machineId) &&
+        !session?.endedAt &&
+        Number.isFinite(lastPingAt) &&
+        now - lastPingAt <= PANEL_SESSION_GAP
+      );
+    });
+  // New clients report one signed-device-authorised session per open VFS
+  // panel. Legacy clients keep the former one-profile-per-machine fallback.
+  const machinesWithPanelSessions = new Set(
+    onlineSessions.filter((session) => sessionProfileId(session))
       .map((session) => normalizeDeviceId(session.machineId))
-      .filter(Boolean)
   );
-  const onlineProfileCount = onlineMachineIds.size;
+  const onlineProfiles = new Set();
+  for (const session of onlineSessions) {
+    const panelId = sessionProfileId(session);
+    const machineId = normalizeDeviceId(session.machineId);
+    if (panelId) onlineProfiles.add(panelId);
+    else if (machineId && !machinesWithPanelSessions.has(machineId)) onlineProfiles.add(`legacy:${machineId}`);
+  }
+  const onlineProfileCount = onlineProfiles.size;
 
   return {
     id: r.id,
@@ -1448,27 +1485,35 @@ const server = http.createServer(async (req, res) => {
         }
       }
 
-      const activeSession = sessions.find((session) => (
-        session?.machineId === machine_id &&
-        !session?.endedAt &&
-        Number.isFinite(Date.parse(session?.lastPingAt || "")) &&
-        now - Date.parse(session.lastPingAt) <= SESSION_GAP
-      ));
+      const profileSessionIds = normaliseProfileSessionIds(body.profile_sessions);
+      // Old extension versions omit profile_sessions and keep their original
+      // one-session-per-device behaviour until they are updated.
+      const sessionIds = profileSessionIds.length ? profileSessionIds : [""];
+      for (const profileSessionId of sessionIds) {
+        const activeSession = sessions.find((session) => (
+          session?.machineId === machine_id &&
+          String(session?.profileSessionId || "") === profileSessionId &&
+          !session?.endedAt &&
+          Number.isFinite(Date.parse(session?.lastPingAt || "")) &&
+          now - Date.parse(session.lastPingAt) <= SESSION_GAP
+        ));
 
-      if (activeSession) {
-        activeSession.lastPingAt = now.toISOString();
-        activeSession.ip = ip;
-      } else {
-        sessions.unshift({
-          id: uuidv4(),
-          startedAt: now.toISOString(),
-          lastPingAt: now.toISOString(),
-          endedAt: null,
-          ip: ip,
-          machineId: machine_id,
-        });
+        if (activeSession) {
+          activeSession.lastPingAt = now.toISOString();
+          activeSession.ip = ip;
+        } else {
+          sessions.unshift({
+            id: uuidv4(),
+            startedAt: now.toISOString(),
+            lastPingAt: now.toISOString(),
+            endedAt: null,
+            ip: ip,
+            machineId: machine_id,
+            profileSessionId: profileSessionId || null,
+          });
+        }
       }
-      if (sessions.length > 50) sessions.length = 50;
+      if (sessions.length > 200) sessions.length = 200;
 
       const hbHistory = licence.heartbeat_history || [];
       hbHistory.unshift({
