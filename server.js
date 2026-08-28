@@ -1157,7 +1157,14 @@ const server = http.createServer(async (req, res) => {
         await client.query("ROLLBACK");
         return json(res, 200, { ok: false, reason: "browser_mismatch" });
       }
-      if (!existingDevice && activeDevices(devices).length >= normaliseDeviceLimit(licence.max_devices)) {
+      // A new Windows binding is deliberately created only by Chrome. Chrome
+      // profiles share the same DPAPI-backed host key; alternate browsers cannot
+      // consume a device slot after an administrator reset.
+      if (!existingDevice && isSecureDevice && browserInfo?.browser_family !== "chrome") {
+        await client.query("ROLLBACK");
+        return json(res, 200, { ok: false, reason: "browser_not_allowed" });
+      }
+            if (!existingDevice && activeDevices(devices).length >= normaliseDeviceLimit(licence.max_devices)) {
         await client.query("ROLLBACK");
         return json(res, 200, { ok: false, reason: "device_limit_reached" });
       }
@@ -1218,6 +1225,11 @@ const server = http.createServer(async (req, res) => {
     const attestation = verifyDeviceAttestation(body.device_attestation, key, machineId);
     if (!attestation.ok) return json(res, 200, { ok: false, reason: attestation.reason });
     const browserInfo = normaliseAttestedBrowserInfo(attestation, body);
+    // Legacy browser-profile bindings may become the DPAPI-backed host identity
+    // only through Chrome, keeping a reset deterministic and secure.
+    if (browserInfo.browser_family !== "chrome") {
+      return json(res, 200, { ok: false, reason: "browser_not_allowed" });
+    }
 
     const client = await pool.connect();
     try {
