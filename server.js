@@ -328,8 +328,9 @@ function verifiedVpsIssuer(req, rawBody) {
 
 function normalizeVpsSignal(body) {
   if (!body || typeof body !== "object" || Array.isArray(body)) return null;
-  const allowedKeys = new Set(["eventId", "mission", "city", "subcategory", "foundAt"]);
+  const allowedKeys = new Set(["eventId", "mission", "city", "subcategory", "foundAt", "test"]);
   if (Object.keys(body).some((key) => !allowedKeys.has(key))) return null;
+  if (body.test !== undefined && typeof body.test !== "boolean") return null;
 
   const eventId = String(body.eventId || "").trim();
   const mission = String(body.mission || "").trim().toLowerCase();
@@ -349,7 +350,14 @@ function normalizeVpsSignal(body) {
     if (foundAt.length > 40 || Number.isNaN(Date.parse(foundAt))) return null;
   }
 
-  return { eventId, mission, city, subcategory, missionName: target.missionName };
+  return {
+    eventId,
+    mission,
+    city,
+    subcategory,
+    missionName: target.missionName,
+    test: body.test === true,
+  };
 }
 
 function json(res, statusCode, body) {
@@ -456,13 +464,16 @@ const VPS_SIGNAL_TARGETS = Object.freeze({
   nld: Object.freeze({ missionName: "Netherlands", cities: new Set(["NER", "NTTG"]) }),
 });
 
-function buildSlotAlertMessage({ missionName, city, subcategory }) {
+function buildSlotAlertMessage({ missionName, city, subcategory, test = false }) {
   const flag     = MISSION_FLAGS[missionName] || "🌍";
   const cityName = CITY_NAMES[city] || city || "Unknown";
   const time     = formatMoroccoTimestamp(new Date());
+  const headline = test
+    ? "🧪 *SLOTHAWK TEST SIGNAL — NO SLOT CONFIRMED*"
+    : "🦅 *SLOTHAWK SPOTTED A SLOT* 🦅";
 
   return [
-    "🦅 *SLOTHAWK SPOTTED A SLOT* 🦅",
+    headline,
     "▬▬▬▬▬▬▬▬▬▬▬▬▬▬",
     `PAYS: ${escapeMarkdownV2(missionName)} ${flag}`,
     `TYPE: ${escapeMarkdownV2(subcategory)}`,
@@ -1058,6 +1069,7 @@ const server = http.createServer(async (req, res) => {
       missionName: event.missionName,
       city: event.city,
       subcategory: event.subcategory,
+      test: event.test,
     });
 
     let telegramResult;
