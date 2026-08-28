@@ -445,6 +445,142 @@ function upsertActiveDevice(value, machineId, ip, browserInfo, nowIso) {
   devices.push({ machineId: id, ip, firstSeenAt: nowIso, browserInfo, active: true, removedAt: null });
   return { ok: true, devices };
 }
+
+const DEVICE_SECURITY_ENFORCED = String(process.env.DEVICE_SECURITY_ENFORCED || "").toLowerCase() === "true";
+const DEVICE_CHALLENGE_PURPOSE = "slothawk-device-attestation-v1";
+const DEVICE_CHALLENGE_TTL_SECONDS = 120;
+const SECURE_DEVICE_ID_RE = /^sh-[0-9a-f]{32}$/i;
+const DEVICE_BROWSER_FAMILIES = new Set(["chrome", "edge", "brave", "opera", "firefox"]);
+const usedDeviceChallenges = new Map();
+
+function isLegacyDeviceId(value) {
+  return /^(?:dev-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}|fp-[0-9a-f]{16})$/i.test(String(value || ""));
+}
+
+function cleanDeviceBrowserFamily(value) {
+  const family = String(value || "").trim().toLowerCase();
+  return DEVICE_BROWSER_FAMILIES.has(family) ? family : "";
+}
+
+function deviceBrowserFamily(device) {
+  return cleanDeviceBrowserFamily(device?.browserInfo?.browser_family);
+}
+
+function base64UrlBuffer(value) {
+  const text = String(value || "");
+  if (!/^[A-Za-z0-9_-]+$/.test(text)) return null;
+  const padded = text.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((text.length + 3) % 4);
+  try { return Buffer.from(padded, "base64"); } catch { return null; }
+}
+
+function secureDeviceIdFromPublicKey(publicKey) {
+  if (!publicKey || publicKey.kty !== "RSA") return "";
+  const modulus = String(publicKey.n || "");
+  const exponent = String(publicKey.e || "");
+  if (!/^[A-Za-z0-9_-]{300,800}$/.test(modulus) || !/^[A-Za-z0-9_-]{2,16}$/.test(exponent)) return "";
+  return "sh-" + crypto.createHash("sha256").update(`v1\n${modulus}\n${exponent}`, "utf8").digest("hex").slice(0, 32);
+}
+
+function pruneUsedDeviceChallenges(now = Date.now()) {
+  for (const [id, expiresAt] of usedDeviceChallenges) {
+    if (expiresAt <= now) usedDeviceChallenges.delete(id);
+  }
+  while (usedDeviceChallenges.size > 2048) {
+    const oldest = usedDeviceChallenges.keys().next().value;
+    if (!oldest) break;
+    usedDeviceChallenges.delete(oldest);
+  }
+}
+
+function consumeDeviceChallenge(id) {
+  const key = String(id || "");
+  if (!/^[0-9a-f-]{36}$/i.test(key)) return false;
+  const now = Date.now();
+  pruneUsedDeviceChallenges(now);
+  if (usedDeviceChallenges.has(key)) return false;
+  usedDeviceChallenges.set(key, now + DEVICE_CHALLENGE_TTL_SECONDS * 1000);
+  return true;
+}
+
+function issueDeviceChallenge(key) {
+  return jwt.sign({
+    purpose: DEVICE_CHALLENGE_PURPOSE,
+    licence_key: key,
+    challenge_id: uuidv4(),
+    nonce: crypto.randomBytes(24).toString("base64url"),
+  }, JWT_SECRET, { expiresIn: DEVICE_CHALLENGE_TTL_SECONDS });
+}
+
+function verifyDeviceAttestation(raw, licenceKey, expectedMachineId) {
+  const attestation = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : null;
+  if (!attestation) return { ok: false, reason: "device_attestation_required" };
+
+  const challengeText = String(attestation.challenge || "");
+  const browserFamily = cleanDeviceBrowserFamily(attestation.browser_family);
+  const publicKey = attestation.public_key;
+  const signature = base64UrlBuffer(attestation.signature);
+  const machineId = String(expectedMachineId || "").trim().toLowerCase();
+  if (!SECURE_DEVICE_ID_RE.test(machineId) || !browserFamily || !signature || signature.length < 128 || signature.length > 1024) {
+    return { ok: false, reason: "invalid_device_attestation" };
+  }
+
+  let challenge;
+  try { challenge = jwt.verify(challengeText, JWT_SECRET); }
+  catch { return { ok: false, reason: "invalid_device_attestation" }; }
+
+  if (challenge?.purpose !== DEVICE_CHALLENGE_PURPOSE ||
+      String(challenge?.licence_key || "") !== String(licenceKey || "") ||
+      !/^[0-9a-f-]{36}$/i.test(String(challenge?.challenge_id || ""))) {
+    return { ok: false, reason: "invalid_device_attestation" };
+  }
+
+  const derivedMachineId = secureDeviceIdFromPublicKey(publicKey);
+  if (!derivedMachineId || !equalTextConstantTime(derivedMachineId, machineId)) {
+    return { ok: false, reason: "invalid_device_attestation" };
+  }
+
+  try {
+    const verifier = crypto.createPublicKey({ key: { kty: "RSA", n: publicKey.n, e: publicKey.e }, format: "jwk" });
+    const message = Buffer.from(`v1\n${challengeText}\n${machineId}\n${browserFamily}`, "utf8");
+    if (!crypto.verify("RSA-SHA256", message, verifier, signature)) {
+      return { ok: false, reason: "invalid_device_attestation" };
+    }
+  } catch {
+    return { ok: false, reason: "invalid_device_attestation" };
+  }
+
+  if (!consumeDeviceChallenge(challenge.challenge_id)) return { ok: false, reason: "replayed_device_attestation" };
+  return { ok: true, browserInfo: { browser_family: browserFamily } };
+}
+
+function normaliseAttestedBrowserInfo(attestationResult, body) {
+  const version = String(body?.browser_info?.extension_version || "").replace(/[\u0000-\u001F\u007F]/g, "").trim().slice(0, 32);
+  return { extension_version: version, browser_family: attestationResult.browserInfo.browser_family };
+}
+
+function hasBrowserMismatch(device, browserInfo) {
+  const bound = deviceBrowserFamily(device);
+  const presented = cleanDeviceBrowserFamily(browserInfo?.browser_family);
+  return !!bound && !!presented && bound !== presented;
+}
+
+function buildLicenceToken(key, machineId, username, expiresAt) {
+  return jwt.sign(
+    { license_key: key, machine_id: machineId, username: username || "", expires_at: expiresAt instanceof Date ? expiresAt.toISOString() : expiresAt },
+    JWT_SECRET,
+    { expiresIn: JWT_EXPIRES }
+  );
+}
+
+function legacyDeviceFromLicence(licence, devices, machineId) {
+  const known = devices.find((device) => device.machineId === machineId);
+  if (known) return known;
+  if (!devices.length && String(licence?.machine_id || "") === machineId) {
+    return { machineId, ip: null, firstSeenAt: licence?.activated_at ? new Date(licence.activated_at).toISOString() : null, browserInfo: null, active: true, removedAt: null };
+  }
+  return null;
+}
+
 function json(res, statusCode, body) {
   res.writeHead(statusCode, {
     "Content-Type": "application/json",
@@ -958,15 +1094,46 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  // ── POST /device-challenge ────────────────────────────────────────────────
+  // A short-lived server challenge is signed by the DPAPI-protected key inside
+  // the local Signal helper. The helper's public key deterministically produces
+  // the secure device ID, so another PC cannot reuse a copied browser profile.
+  if (req.method === "POST" && url === "/device-challenge") {
+    const body = await readBody(req);
+    const key = (body.key || "").trim().toUpperCase();
+    if (!key) return json(res, 400, { ok: false, error: "Missing key" });
+    try {
+      const { rows } = await pool.query(`SELECT status, expires_at, deactivated, blocked FROM licences WHERE license_key = $1`, [key]);
+      const licence = rows[0];
+      const stateReason = licenceStatusReason(licence);
+      if (stateReason) return json(res, 200, { ok: false, reason: stateReason });
+      return json(res, 200, { ok: true, challenge: issueDeviceChallenge(key) });
+    } catch {
+      return json(res, 500, { ok: false, error: "device_challenge_failed" });
+    }
+  }
+
   // ── POST /activate-licence ────────────────────────────────────────────────
   if (req.method === "POST" && url === "/activate-licence") {
     const body       = await readBody(req);
     const key        = (body.key || "").trim().toUpperCase();
-    const machine_id = (body.machine_id || "").trim();
+    const machine_id = normalizeDeviceId(body.machine_id);
     const ip         = getClientIp(req);
 
     if (!key) return json(res, 400, { ok: false, error: "Missing key" });
-    if (!normalizeDeviceId(machine_id)) return json(res, 200, { ok: false, reason: "invalid_device" });
+    if (!machine_id) return json(res, 200, { ok: false, reason: "invalid_device" });
+
+    const isSecureDevice = SECURE_DEVICE_ID_RE.test(machine_id);
+    let attestation = null;
+    let browserInfo = null;
+    if (isSecureDevice) {
+      attestation = verifyDeviceAttestation(body.device_attestation, key, machine_id);
+      if (!attestation.ok) return json(res, 200, { ok: false, reason: attestation.reason });
+      browserInfo = normaliseAttestedBrowserInfo(attestation, body);
+    } else {
+      if (DEVICE_SECURITY_ENFORCED) return json(res, 200, { ok: false, reason: "update_required" });
+      browserInfo = body.browser_info && typeof body.browser_info === "object" ? body.browser_info : null;
+    }
 
     const client = await pool.connect();
     try {
@@ -978,26 +1145,29 @@ const server = http.createServer(async (req, res) => {
       const stateReason = licenceStatusReason(licence);
       if (stateReason) { await client.query("ROLLBACK"); return json(res, 200, { ok: false, reason: stateReason }); }
 
-      const deviceId = normalizeDeviceId(machine_id);
       const now = new Date();
       const nowIso = now.toISOString();
       const devices = normaliseKnownDevices(licence.known_devices);
-      const existingDevice = devices.find((device) => device.machineId === deviceId);
+      const existingDevice = devices.find((device) => device.machineId === machine_id);
       if (existingDevice && (!existingDevice.active || existingDevice.removedAt)) {
         await client.query("ROLLBACK");
         return json(res, 200, { ok: false, reason: "device_removed" });
+      }
+      if (existingDevice && isSecureDevice && hasBrowserMismatch(existingDevice, browserInfo)) {
+        await client.query("ROLLBACK");
+        return json(res, 200, { ok: false, reason: "browser_mismatch" });
       }
       if (!existingDevice && activeDevices(devices).length >= normaliseDeviceLimit(licence.max_devices)) {
         await client.query("ROLLBACK");
         return json(res, 200, { ok: false, reason: "device_limit_reached" });
       }
 
-      const deviceUpdate = upsertActiveDevice(devices, deviceId, ip, body.browser_info || null, nowIso);
+      const deviceUpdate = upsertActiveDevice(devices, machine_id, ip, browserInfo, nowIso);
       if (!deviceUpdate.ok) { await client.query("ROLLBACK"); return json(res, 200, { ok: false, reason: "device_removed" }); }
 
       const expiresAt = licence.expires_at || (() => { const d = new Date(now); d.setDate(d.getDate() + licence.duration); return d; })();
       const actHistory = Array.isArray(licence.activation_history) ? licence.activation_history : [];
-      actHistory.unshift({ id: uuidv4(), machineId: deviceId, ip, version: (body.browser_info || {}).extension_version || "", createdAt: nowIso });
+      actHistory.unshift({ id: uuidv4(), machineId: machine_id, ip, version: browserInfo?.extension_version || "", browser: browserInfo?.browser_family || "", createdAt: nowIso });
       if (actHistory.length > 20) actHistory.length = 20;
 
       await client.query(
@@ -1012,20 +1182,103 @@ const server = http.createServer(async (req, res) => {
         known_devices = $5,
         activation_history = $6
        WHERE license_key = $7`,
-        [deviceId, now, expiresAt, ip, JSON.stringify(deviceUpdate.devices), JSON.stringify(actHistory), key]
+        [machine_id, now, expiresAt, ip, JSON.stringify(deviceUpdate.devices), JSON.stringify(actHistory), key]
       );
 
       await client.query("COMMIT");
-      const token = jwt.sign(
-        { license_key: key, machine_id: deviceId, username: licence.username || "", expires_at: expiresAt instanceof Date ? expiresAt.toISOString() : expiresAt },
-        JWT_SECRET,
-        { expiresIn: JWT_EXPIRES }
-      );
-      console.log("[ACTIVATE] OK key=" + key + " device=" + deviceId.slice(0, 12));
+      const token = buildLicenceToken(key, machine_id, licence.username || "", expiresAt);
+      console.log("[ACTIVATE] OK key=" + key + " device=" + machine_id.slice(0, 12));
       return json(res, 200, { ok: true, token, username: licence.username || "", expiresAt: expiresAt instanceof Date ? expiresAt.toISOString() : expiresAt });
     } catch (err) {
       await client.query("ROLLBACK").catch(() => {});
       console.error("[ACTIVATE] error:", err.message);
+      return json(res, 500, { ok: false, error: "DB error" });
+    } finally { client.release(); }
+  }
+
+  // ── POST /migrate-device ──────────────────────────────────────────────────
+  // Only a still-valid legacy session can exchange its old per-profile ID for
+  // the secure host identity. It is a replacement, not an additional slot.
+  if (req.method === "POST" && url === "/migrate-device") {
+    const body = await readBody(req);
+    const key = (body.key || "").trim().toUpperCase();
+    const token = (body.token || "").trim();
+    const machineId = normalizeDeviceId(body.machine_id);
+    const ip = getClientIp(req);
+    if (!key || !token || !SECURE_DEVICE_ID_RE.test(machineId)) return json(res, 200, { ok: false, reason: "invalid_device" });
+
+    let decoded;
+    try { decoded = jwt.verify(token, JWT_SECRET); }
+    catch { return json(res, 200, { ok: false, reason: "invalid_token" }); }
+    const legacyMachineId = normalizeDeviceId(decoded.machine_id);
+    if (decoded.license_key !== key || !isLegacyDeviceId(legacyMachineId)) {
+      return json(res, 200, { ok: false, reason: "migration_not_allowed" });
+    }
+
+    const attestation = verifyDeviceAttestation(body.device_attestation, key, machineId);
+    if (!attestation.ok) return json(res, 200, { ok: false, reason: attestation.reason });
+    const browserInfo = normaliseAttestedBrowserInfo(attestation, body);
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const locked = await client.query(`SELECT * FROM licences WHERE license_key = $1 FOR UPDATE`, [key]);
+      const licence = locked.rows[0];
+      const stateReason = licenceStatusReason(licence);
+      if (stateReason) { await client.query("ROLLBACK"); return json(res, 200, { ok: false, reason: stateReason }); }
+
+      const devices = normaliseKnownDevices(licence.known_devices);
+      const legacy = legacyDeviceFromLicence(licence, devices, legacyMachineId);
+      if (!legacy || !legacy.active || legacy.removedAt) {
+        await client.query("ROLLBACK");
+        return json(res, 200, { ok: false, reason: "device_removed" });
+      }
+
+      const now = new Date();
+      const nowIso = now.toISOString();
+      const existingSecure = devices.find((device) => device.machineId === machineId);
+      if (existingSecure && (!existingSecure.active || existingSecure.removedAt)) {
+        await client.query("ROLLBACK");
+        return json(res, 200, { ok: false, reason: "device_removed" });
+      }
+      if (existingSecure && hasBrowserMismatch(existingSecure, browserInfo)) {
+        await client.query("ROLLBACK");
+        return json(res, 200, { ok: false, reason: "browser_mismatch" });
+      }
+
+      const nextDevices = devices.filter((device) => device.machineId !== legacyMachineId);
+      if (existingSecure) {
+        const index = nextDevices.findIndex((device) => device.machineId === machineId);
+        nextDevices[index] = { ...nextDevices[index], ip, browserInfo, active: true, removedAt: null };
+      } else {
+        nextDevices.push({
+          machineId,
+          ip,
+          firstSeenAt: legacy.firstSeenAt || nowIso,
+          browserInfo,
+          active: true,
+          removedAt: null,
+        });
+      }
+
+      const actHistory = Array.isArray(licence.activation_history) ? licence.activation_history : [];
+      actHistory.unshift({ id: uuidv4(), type: "device_migration", from: legacyMachineId, to: machineId, ip, browser: browserInfo.browser_family, createdAt: nowIso });
+      if (actHistory.length > 20) actHistory.length = 20;
+
+      const primaryMachine = String(licence.machine_id || "") === legacyMachineId ? machineId : licence.machine_id;
+      await client.query(
+        `UPDATE licences SET machine_id = $1, known_devices = $2, activation_history = $3, last_seen = $4, last_ip = $5 WHERE license_key = $6`,
+        [primaryMachine, JSON.stringify(nextDevices), JSON.stringify(actHistory), now, ip, key]
+      );
+      await client.query("COMMIT");
+
+      const expiresAt = licence.expires_at;
+      const nextToken = buildLicenceToken(key, machineId, licence.username || "", expiresAt);
+      console.log("[MIGRATE] OK key=" + key + " device=" + machineId.slice(0, 12));
+      return json(res, 200, { ok: true, token: nextToken, username: licence.username || "", expiresAt });
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
+      console.error("[MIGRATE] error:", err.message);
       return json(res, 500, { ok: false, error: "DB error" });
     } finally { client.release(); }
   }
@@ -1034,13 +1287,26 @@ const server = http.createServer(async (req, res) => {
     const body  = await readBody(req);
     const token = (body.token || "").trim();
     const key   = (body.key   || "").trim().toUpperCase();
+    const machineId = normalizeDeviceId(body.machine_id);
 
     if (!token) return json(res, 200, { ok: false, reason: "missing_token" });
 
     try {
       const decoded = jwt.verify(token, JWT_SECRET);
-      if (key && decoded.license_key !== key)
-        return json(res, 200, { ok: false, reason: "key_mismatch" });
+      if (key && decoded.license_key !== key) return json(res, 200, { ok: false, reason: "key_mismatch" });
+      if (machineId && decoded.machine_id !== machineId) return json(res, 200, { ok: false, reason: "machine_blocked" });
+
+      const boundMachineId = normalizeDeviceId(decoded.machine_id);
+      const isSecureDevice = SECURE_DEVICE_ID_RE.test(boundMachineId);
+      let browserInfo = null;
+      if (isSecureDevice) {
+        if (machineId !== boundMachineId) return json(res, 200, { ok: false, reason: "machine_blocked" });
+        const attestation = verifyDeviceAttestation(body.device_attestation, decoded.license_key, boundMachineId);
+        if (!attestation.ok) return json(res, 200, { ok: false, reason: attestation.reason });
+        browserInfo = normaliseAttestedBrowserInfo(attestation, body);
+      } else if (DEVICE_SECURITY_ENFORCED) {
+        return json(res, 200, { ok: false, reason: "update_required" });
+      }
 
       const { rows } = await pool.query(
         `SELECT status, expires_at, deactivated, blocked, active, machine_id, known_devices, max_devices, username FROM licences WHERE license_key = $1`,
@@ -1053,7 +1319,10 @@ const server = http.createServer(async (req, res) => {
       if (l.blocked) return json(res, 200, { ok: false, reason: "machine_blocked" });
       if (l.status !== "active") return json(res, 200, { ok: false, reason: "licence_inactive" });
       if (l.expires_at && new Date() > new Date(l.expires_at)) return json(res, 200, { ok: false, reason: "licence_expired" });
-      if (!isDeviceAllowed(l, decoded.machine_id)) return json(res, 200, { ok: false, reason: "device_removed" });
+      if (!isDeviceAllowed(l, boundMachineId)) return json(res, 200, { ok: false, reason: "device_removed" });
+
+      const boundDevice = normaliseKnownDevices(l.known_devices).find((device) => device.machineId === boundMachineId);
+      if (isSecureDevice && hasBrowserMismatch(boundDevice, browserInfo)) return json(res, 200, { ok: false, reason: "browser_mismatch" });
 
       return json(res, 200, { ok: true, username: l.username || "", expiresAt: l.expires_at });
     } catch {
@@ -1065,38 +1334,43 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "POST" && url === "/refresh-token") {
     const body       = await readBody(req);
     const token      = (body.token      || "").trim();
-    const machine_id = (body.machine_id || "").trim();
+    const machineId  = normalizeDeviceId(body.machine_id);
 
-    if (!token || !machine_id) return json(res, 400, { ok: false, error: "Missing params" });
+    if (!token || !machineId) return json(res, 400, { ok: false, error: "Missing params" });
 
     try {
       let decoded;
       try { decoded = jwt.verify(token, JWT_SECRET, { ignoreExpiration: true }); }
       catch { return json(res, 200, { ok: false, reason: "invalid_token" }); }
+      if (decoded.machine_id !== machineId) return json(res, 200, { ok: false, reason: "machine_blocked" });
 
-      if (decoded.machine_id !== machine_id) return json(res, 200, { ok: false, reason: "machine_blocked" });
+      const isSecureDevice = SECURE_DEVICE_ID_RE.test(machineId);
+      let browserInfo = null;
+      if (isSecureDevice) {
+        const attestation = verifyDeviceAttestation(body.device_attestation, decoded.license_key, machineId);
+        if (!attestation.ok) return json(res, 200, { ok: false, reason: attestation.reason });
+        browserInfo = normaliseAttestedBrowserInfo(attestation, body);
+      } else if (DEVICE_SECURITY_ENFORCED) {
+        return json(res, 200, { ok: false, reason: "update_required" });
+      }
 
       const { rows } = await pool.query(
         `SELECT status, expires_at, deactivated, blocked, active, machine_id, known_devices, max_devices, username FROM licences WHERE license_key = $1`,
         [decoded.license_key]
       );
-
       if (!rows.length) return json(res, 200, { ok: false, reason: "not_found" });
       const l = rows[0];
       if (l.deactivated || l.status === "revoked" || l.status === "deactivated") return json(res, 200, { ok: false, reason: "revoked" });
       if (l.status !== "active") return json(res, 200, { ok: false, reason: "licence_inactive" });
       if (l.expires_at && new Date() > new Date(l.expires_at)) return json(res, 200, { ok: false, reason: "licence_expired" });
-      if (!isDeviceAllowed(l, machine_id)) return json(res, 200, { ok: false, reason: "device_removed" });
+      if (!isDeviceAllowed(l, machineId)) return json(res, 200, { ok: false, reason: "device_removed" });
+      const boundDevice = normaliseKnownDevices(l.known_devices).find((device) => device.machineId === machineId);
+      if (isSecureDevice && hasBrowserMismatch(boundDevice, browserInfo)) return json(res, 200, { ok: false, reason: "browser_mismatch" });
 
-      const newToken = jwt.sign(
-        { license_key: decoded.license_key, machine_id, username: l.username || "", expires_at: l.expires_at },
-        JWT_SECRET,
-        { expiresIn: JWT_EXPIRES }
-      );
-
+      const newToken = buildLicenceToken(decoded.license_key, machineId, l.username || "", l.expires_at);
       await pool.query(`UPDATE licences SET last_seen = NOW() WHERE license_key = $1`, [decoded.license_key]);
       return json(res, 200, { ok: true, token: newToken, username: l.username || "" });
-    } catch (err) {
+    } catch {
       return json(res, 500, { ok: false, error: "DB error" });
     }
   }
@@ -1118,8 +1392,8 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "POST" && url === "/heartbeat") {
     const body       = await readBody(req);
     const token      = (body.token      || "").trim();
-    const machine_id = (body.machine_id || "").trim();
-    const version    = body.extension_version || "";
+    const machine_id = normalizeDeviceId(body.machine_id);
+    const version    = String(body?.browser_info?.extension_version || "").slice(0, 32);
     const ip         = getClientIp(req);
 
     if (!token) return json(res, 200, { ok: false, reason: "missing_token" });
@@ -1127,8 +1401,18 @@ const server = http.createServer(async (req, res) => {
     try {
       const decoded = jwt.verify(token, JWT_SECRET);
 
-      if (decoded.machine_id && machine_id && decoded.machine_id !== machine_id)
+      if (decoded.machine_id !== machine_id)
         return json(res, 200, { ok: false, reason: "machine_blocked" });
+
+      const isSecureDevice = SECURE_DEVICE_ID_RE.test(machine_id);
+      let browserInfo = null;
+      if (isSecureDevice) {
+        const attestation = verifyDeviceAttestation(body.device_attestation, decoded.license_key, machine_id);
+        if (!attestation.ok) return json(res, 200, { ok: false, reason: attestation.reason });
+        browserInfo = normaliseAttestedBrowserInfo(attestation, body);
+      } else if (DEVICE_SECURITY_ENFORCED) {
+        return json(res, 200, { ok: false, reason: "update_required" });
+      }
 
       const { rows } = await pool.query(`SELECT * FROM licences WHERE license_key = $1`, [decoded.license_key]);
 
@@ -1139,6 +1423,8 @@ const server = http.createServer(async (req, res) => {
       if (licence.status !== "active") return json(res, 200, { ok: false, reason: "licence_inactive" });
       if (licence.expires_at && new Date() > new Date(licence.expires_at)) return json(res, 200, { ok: false, reason: "licence_expired" });
       if (!isDeviceAllowed(licence, machine_id)) return json(res, 200, { ok: false, reason: "device_removed" });
+      const boundDevice = normaliseKnownDevices(licence.known_devices).find((device) => device.machineId === machine_id);
+      if (isSecureDevice && hasBrowserMismatch(boundDevice, browserInfo)) return json(res, 200, { ok: false, reason: "browser_mismatch" });
 
       const now = new Date();
 
