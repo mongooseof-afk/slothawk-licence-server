@@ -1194,13 +1194,10 @@ const server = http.createServer(async (req, res) => {
         await client.query("ROLLBACK");
         return json(res, 200, { ok: false, reason: "browser_mismatch" });
       }
-      // A new Windows binding is deliberately created only by Chrome. Chrome
-      // profiles share the same DPAPI-backed host key; alternate browsers cannot
-      // consume a device slot after an administrator reset.
-      if (!existingDevice && isSecureDevice && browserInfo?.browser_family !== "chrome") {
-        await client.query("ROLLBACK");
-        return json(res, 200, { ok: false, reason: "browser_not_allowed" });
-      }
+      // First secure activation binds this Windows host to the browser family
+      // signed by SlotHawk Signal. Chrome, Brave and Edge are all valid first
+      // browsers; later requests from a different family are rejected by
+      // hasBrowserMismatch above and on every authenticated endpoint.
             if (!existingDevice && activeDevices(devices).length >= normaliseDeviceLimit(licence.max_devices)) {
         await client.query("ROLLBACK");
         return json(res, 200, { ok: false, reason: "device_limit_reached" });
@@ -1262,11 +1259,8 @@ const server = http.createServer(async (req, res) => {
     const attestation = verifyDeviceAttestation(body.device_attestation, key, machineId);
     if (!attestation.ok) return json(res, 200, { ok: false, reason: attestation.reason });
     const browserInfo = normaliseAttestedBrowserInfo(attestation, body);
-    // Legacy browser-profile bindings may become the DPAPI-backed host identity
-    // only through Chrome, keeping a reset deterministic and secure.
-    if (browserInfo.browser_family !== "chrome") {
-      return json(res, 200, { ok: false, reason: "browser_not_allowed" });
-    }
+    // Migration records the first verified browser family with the new
+    // DPAPI-backed host identity. The same family remains required afterwards.
 
     const client = await pool.connect();
     try {
