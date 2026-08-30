@@ -466,6 +466,13 @@ function sessionProfileId(session) {
   return PROFILE_SESSION_ID_RE.test(id) ? id : "";
 }
 
+// This is Signal-derived telemetry from the authenticated loopback relay.
+// It is intentionally bounded and never changes a licence device limit.
+const MAX_SIGNAL_PROFILE_COUNT = MAX_PROFILE_SESSIONS_PER_HEARTBEAT;
+function normaliseSignalProfileCount(value) {
+  return Number.isInteger(value) && value >= 0 && value <= MAX_SIGNAL_PROFILE_COUNT ? value : null;
+}
+
 function isDeviceAllowed(licence, machineId) {
   const id = normalizeDeviceId(machineId);
   if (!id || !licence) return false;
@@ -877,14 +884,33 @@ function mapRow(r) {
     onlineSessions.filter((session) => sessionProfileId(session))
       .map((session) => normalizeDeviceId(session.machineId))
   );
-  const onlineProfiles = new Set();
+  const onlineProfilesByMachine = new Map();
   for (const session of onlineSessions) {
     const panelId = sessionProfileId(session);
     const machineId = normalizeDeviceId(session.machineId);
-    if (panelId) onlineProfiles.add(panelId);
-    else if (machineId && !machinesWithPanelSessions.has(machineId)) onlineProfiles.add(`legacy:${machineId}`);
+    if (!machineId) continue;
+    if (!onlineProfilesByMachine.has(machineId)) onlineProfilesByMachine.set(machineId, new Set());
+    if (panelId) onlineProfilesByMachine.get(machineId).add(panelId);
+    else if (!machinesWithPanelSessions.has(machineId)) onlineProfilesByMachine.get(machineId).add(`legacy:${machineId}`);
   }
-  const onlineProfileCount = onlineProfiles.size;
+
+  // Prefer the live count from SlotHawk Signal whenever it is present for a
+  // currently active device. Older clients retain the heartbeat-panel count.
+  const freshSignalCounts = new Map();
+  for (const heartbeat of (Array.isArray(r.heartbeat_history) ? r.heartbeat_history : [])) {
+    const machineId = normalizeDeviceId(heartbeat?.machineId);
+    const count = normaliseSignalProfileCount(heartbeat?.signalProfileCount);
+    const at = Date.parse(heartbeat?.createdAt || "");
+    if (!machineId || !activeMachineIds.has(machineId) || count === null || !Number.isFinite(at) || now - at > PANEL_SESSION_GAP) continue;
+    const previous = freshSignalCounts.get(machineId);
+    if (!previous || at > previous.at) freshSignalCounts.set(machineId, { count, at });
+  }
+
+  let onlineProfileCount = 0;
+  for (const machineId of activeMachineIds) {
+    const signalCount = freshSignalCounts.get(machineId);
+    onlineProfileCount += signalCount ? signalCount.count : (onlineProfilesByMachine.get(machineId)?.size || 0);
+  }
 
   return {
     id: r.id,
@@ -1856,6 +1882,7 @@ const server = http.createServer(async (req, res) => {
       }
 
       const profileSessionIds = normaliseProfileSessionIds(body.profile_sessions);
+      const signalProfileCount = normaliseSignalProfileCount(body.signal_profile_count);
       // Old extension versions omit profile_sessions and keep their original
       // one-session-per-device behaviour until they are updated.
       const sessionIds = profileSessionIds.length ? profileSessionIds : [""];
@@ -1892,6 +1919,7 @@ const server = http.createServer(async (req, res) => {
         ip: ip,
         version: version,
         machineId: machine_id,
+        signalProfileCount,
       });
       if (hbHistory.length > 50) hbHistory.length = 50;
 
