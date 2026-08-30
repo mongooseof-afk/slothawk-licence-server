@@ -63,6 +63,7 @@ const ALERT_RATE_LIMIT      = 20;
 const ALERT_RATE_WINDOW_MS  = 60_000;
 const alertRateMap = new Map(); // license_key → [timestamps]
 const vpsSignalRateMap = new Map(); // issuer key id → [timestamps]
+const signalSessionRateMap = new Map(); // licence key + IP → [timestamps]
 
 // ── Global Signal relay ──────────────────────────────────────────────
 // Connections stay only in process memory. A signal deliberately carries
@@ -174,6 +175,19 @@ function checkAlertRateLimit(key) {
   return true;
 }
 
+function checkSignalSessionRateLimit(key, ip) {
+  const rateKey = `${String(key || "")}::${String(ip || "").slice(0, 128)}`;
+  const now = Date.now();
+  const hits = (signalSessionRateMap.get(rateKey) || []).filter((time) => now - time < 60_000);
+  if (hits.length >= 20) {
+    signalSessionRateMap.set(rateKey, hits);
+    return false;
+  }
+  hits.push(now);
+  signalSessionRateMap.set(rateKey, hits);
+  return true;
+}
+
 function checkVpsSignalRateLimit(issuer) {
   const now = Date.now();
   const hits = (vpsSignalRateMap.get(issuer) || []).filter(
@@ -206,6 +220,11 @@ setInterval(() => {
     const filtered = hits.filter(t => now - t < VPS_SIGNAL_RATE_WINDOW_MS);
     if (filtered.length === 0) vpsSignalRateMap.delete(issuer);
     else vpsSignalRateMap.set(issuer, filtered);
+  }
+  for (const [key, hits] of signalSessionRateMap.entries()) {
+    const filtered = hits.filter(t => now - t < 60_000);
+    if (filtered.length === 0) signalSessionRateMap.delete(key);
+    else signalSessionRateMap.set(key, filtered);
   }
 }, 5 * 60_000);
 
@@ -244,6 +263,8 @@ async function initDB() {
       activation_history JSONB NOT NULL DEFAULT '[]',
       sessions           JSONB NOT NULL DEFAULT '[]',
       booking_events     JSONB NOT NULL DEFAULT '[]',
+      signal_sessions    JSONB NOT NULL DEFAULT '[]',
+      signal_events      JSONB NOT NULL DEFAULT '[]',
       max_devices        INTEGER NOT NULL DEFAULT 1
     )
   `);
@@ -251,6 +272,8 @@ async function initDB() {
   // NOT EXISTS does not add new columns to an already-created table.
   await pool.query(`ALTER TABLE licences ADD COLUMN IF NOT EXISTS booking_events JSONB NOT NULL DEFAULT '[]'::jsonb`);
   await pool.query(`ALTER TABLE licences ADD COLUMN IF NOT EXISTS max_devices INTEGER NOT NULL DEFAULT 1`);
+  await pool.query(`ALTER TABLE licences ADD COLUMN IF NOT EXISTS signal_sessions JSONB NOT NULL DEFAULT '[]'::jsonb`);
+  await pool.query(`ALTER TABLE licences ADD COLUMN IF NOT EXISTS signal_events JSONB NOT NULL DEFAULT '[]'::jsonb`);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS vps_signal_events (
       event_id UUID PRIMARY KEY,
@@ -600,6 +623,189 @@ function buildLicenceToken(key, machineId, username, expiresAt) {
   );
 }
 
+
+const SIGNAL_CHALLENGE_PURPOSE = "slothawk-signal-challenge-v1";
+const SIGNAL_SESSION_PURPOSE = "slothawk-signal-session-v1";
+const SIGNAL_CHALLENGE_TTL_SECONDS = 90;
+const SIGNAL_SESSION_TTL_SECONDS = 10 * 60;
+const SIGNAL_SESSION_HISTORY_LIMIT = 50;
+const SIGNAL_EVENT_HISTORY_LIMIT = 50;
+const usedSignalChallenges = new Map();
+
+function pruneUsedSignalChallenges(now = Date.now()) {
+  for (const [id, expiresAt] of usedSignalChallenges) {
+    if (expiresAt <= now) usedSignalChallenges.delete(id);
+  }
+  while (usedSignalChallenges.size > 2048) {
+    const oldest = usedSignalChallenges.keys().next().value;
+    if (!oldest) break;
+    usedSignalChallenges.delete(oldest);
+  }
+}
+
+function consumeSignalChallenge(id) {
+  const value = String(id || "");
+  if (!/^[0-9a-f-]{36}$/i.test(value)) return false;
+  pruneUsedSignalChallenges();
+  if (usedSignalChallenges.has(value)) return false;
+  usedSignalChallenges.set(value, Date.now() + SIGNAL_CHALLENGE_TTL_SECONDS * 1000);
+  return true;
+}
+
+function issueSignalChallenge(key) {
+  return jwt.sign({
+    purpose: SIGNAL_CHALLENGE_PURPOSE,
+    licence_key: key,
+    challenge_id: uuidv4(),
+    nonce: crypto.randomBytes(24).toString("base64url"),
+  }, JWT_SECRET, { expiresIn: SIGNAL_CHALLENGE_TTL_SECONDS });
+}
+
+function normaliseSignalSessions(value) {
+  if (!Array.isArray(value)) return [];
+  const sessions = [];
+  for (const raw of value) {
+    const id = String(raw?.id || "");
+    const machineId = normalizeDeviceId(raw?.machineId);
+    const issuedAt = typeof raw?.issuedAt === "string" ? raw.issuedAt : null;
+    const expiresAt = typeof raw?.expiresAt === "string" ? raw.expiresAt : null;
+    if (!/^[0-9a-f-]{36}$/i.test(id) || !machineId || !issuedAt || !expiresAt) continue;
+    sessions.push({
+      id,
+      machineId,
+      issuedAt,
+      expiresAt,
+      lastVerifiedAt: typeof raw?.lastVerifiedAt === "string" ? raw.lastVerifiedAt : issuedAt,
+      version: typeof raw?.version === "string" ? raw.version.slice(0, 32) : "",
+      ip: typeof raw?.ip === "string" ? raw.ip.slice(0, 128) : "",
+      revokedAt: typeof raw?.revokedAt === "string" ? raw.revokedAt : null,
+      revokeReason: typeof raw?.revokeReason === "string" ? raw.revokeReason.slice(0, 48) : null,
+    });
+    if (sessions.length >= SIGNAL_SESSION_HISTORY_LIMIT) break;
+  }
+  return sessions;
+}
+
+function normaliseSignalEvents(value) {
+  if (!Array.isArray(value)) return [];
+  const events = [];
+  for (const raw of value) {
+    const type = String(raw?.type || "").slice(0, 48);
+    const at = typeof raw?.at === "string" ? raw.at : "";
+    if (!type || !at) continue;
+    events.push({
+      id: /^[0-9a-f-]{36}$/i.test(String(raw?.id || "")) ? raw.id : uuidv4(),
+      type,
+      at,
+      machineId: normalizeDeviceId(raw?.machineId) || null,
+      ip: typeof raw?.ip === "string" ? raw.ip.slice(0, 128) : "",
+      detail: typeof raw?.detail === "string" ? raw.detail.slice(0, 96) : "",
+    });
+    if (events.length >= SIGNAL_EVENT_HISTORY_LIMIT) break;
+  }
+  return events;
+}
+
+function addSignalEvent(events, type, machineId, ip, detail = "") {
+  const next = normaliseSignalEvents(events);
+  next.unshift({ id: uuidv4(), type, at: new Date().toISOString(), machineId: normalizeDeviceId(machineId) || null, ip: String(ip || "").slice(0, 128), detail: String(detail || "").slice(0, 96) });
+  if (next.length > SIGNAL_EVENT_HISTORY_LIMIT) next.length = SIGNAL_EVENT_HISTORY_LIMIT;
+  return next;
+}
+
+function issueSignalSession(key, machineId, sessionId) {
+  return jwt.sign({
+    purpose: SIGNAL_SESSION_PURPOSE,
+    licence_key: key,
+    machine_id: machineId,
+    signal_session_id: sessionId,
+  }, JWT_SECRET, { expiresIn: SIGNAL_SESSION_TTL_SECONDS });
+}
+
+function verifySignalAttestation(body, licenceKey, expectedMachineId) {
+  const challengeText = String(body?.challenge || "");
+  const publicKey = body?.public_key;
+  const signature = base64UrlBuffer(body?.signature);
+  const machineId = String(expectedMachineId || "").trim().toLowerCase();
+  if (!SECURE_DEVICE_ID_RE.test(machineId) || !signature || signature.length < 128 || signature.length > 1024) {
+    return { ok: false, reason: "invalid_signal_attestation" };
+  }
+
+  let challenge;
+  try { challenge = jwt.verify(challengeText, JWT_SECRET); }
+  catch { return { ok: false, reason: "invalid_signal_attestation" }; }
+
+  if (challenge?.purpose !== SIGNAL_CHALLENGE_PURPOSE ||
+      String(challenge?.licence_key || "") !== String(licenceKey || "") ||
+      !/^[0-9a-f-]{36}$/i.test(String(challenge?.challenge_id || ""))) {
+    return { ok: false, reason: "invalid_signal_attestation" };
+  }
+
+  const derivedMachineId = secureDeviceIdFromPublicKey(publicKey);
+  if (!derivedMachineId || !equalTextConstantTime(derivedMachineId, machineId)) {
+    return { ok: false, reason: "invalid_signal_attestation" };
+  }
+
+  try {
+    const verifier = crypto.createPublicKey({ key: { kty: "RSA", n: publicKey.n, e: publicKey.e }, format: "jwk" });
+    const message = Buffer.from(`signal-v1\n${challengeText}\n${machineId}`, "utf8");
+    if (!crypto.verify("RSA-SHA256", message, verifier, signature)) {
+      return { ok: false, reason: "invalid_signal_attestation" };
+    }
+  } catch {
+    return { ok: false, reason: "invalid_signal_attestation" };
+  }
+
+  if (!consumeSignalChallenge(challenge.challenge_id)) return { ok: false, reason: "replayed_signal_attestation" };
+  return { ok: true };
+}
+
+function verifyActiveSignalSession(rawToken, licenceKey, machineId, sessions) {
+  const token = String(rawToken || "");
+  if (!token) return { ok: false, reason: "signal_required" };
+  let decoded;
+  try { decoded = jwt.verify(token, JWT_SECRET); }
+  catch { return { ok: false, reason: "signal_session_invalid" }; }
+
+  const sessionId = String(decoded?.signal_session_id || "");
+  if (decoded?.purpose !== SIGNAL_SESSION_PURPOSE ||
+      String(decoded?.licence_key || "") !== String(licenceKey || "") ||
+      String(decoded?.machine_id || "") !== String(machineId || "") ||
+      !/^[0-9a-f-]{36}$/i.test(sessionId)) {
+    return { ok: false, reason: "signal_session_invalid" };
+  }
+  const session = normaliseSignalSessions(sessions).find((item) => item.id === sessionId && item.machineId === machineId);
+  const expiry = Date.parse(session?.expiresAt || "");
+  if (!session || session.revokedAt || !Number.isFinite(expiry) || expiry <= Date.now()) {
+    return { ok: false, reason: "signal_session_invalid" };
+  }
+  return { ok: true, sessionId };
+}
+
+function requiresSignalSession(browserInfo) {
+  const major = Number(String(browserInfo?.extension_version || "").split(".")[0]);
+  return Number.isInteger(major) && major >= 2;
+}
+
+function signalSecuritySummary(row) {
+  const now = Date.now();
+  const sessions = normaliseSignalSessions(row?.signal_sessions);
+  const active = sessions.filter((session) => !session.revokedAt && Date.parse(session.expiresAt) > now);
+  return {
+    active: active.length > 0,
+    activeSessionCount: active.length,
+    sessions: sessions.map((session) => ({
+      machineId: session.machineId,
+      issuedAt: session.issuedAt,
+      lastVerifiedAt: session.lastVerifiedAt,
+      expiresAt: session.expiresAt,
+      revokedAt: session.revokedAt,
+      version: session.version,
+    })),
+    events: normaliseSignalEvents(row?.signal_events),
+  };
+}
+
 function legacyDeviceFromLicence(licence, devices, machineId) {
   const known = devices.find((device) => device.machineId === machineId);
   if (known) return known;
@@ -705,6 +911,7 @@ function mapRow(r) {
     activationHistory: r.activation_history || [], activation_history: r.activation_history || [],
     sessions: r.sessions || [],
     bookingEvents: r.booking_events || [], booking_events: r.booking_events || [],
+    signalSecurity: signalSecuritySummary(r), signal_security: signalSecuritySummary(r),
   };
 }
 
@@ -879,6 +1086,34 @@ const server = http.createServer(async (req, res) => {
     } catch (err) {
       return json(res, 500, { ok: false, error: err.message });
     }
+  }
+
+
+  // ── PATCH /admin/licences/:id/signal/reset|revoke ─────────────────────────
+  if (req.method === "PATCH" && (url.endsWith("/signal/reset") || url.endsWith("/signal/revoke"))) {
+    const parts = url.split("/").filter(Boolean);
+    const marker = parts.lastIndexOf("licences");
+    const id = marker >= 0 ? parts[marker + 1] : "";
+    if (!id) return json(res, 400, { ok: false, error: "Licence not found" });
+    const action = url.endsWith("/signal/revoke") ? "revoked_by_admin" : "reset_by_admin";
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const locked = await client.query(`SELECT * FROM licences WHERE id = $1 OR license_key = $1 FOR UPDATE`, [id]);
+      const licence = locked.rows[0];
+      if (!licence) { await client.query("ROLLBACK"); return json(res, 404, { ok: false, error: "Licence not found" }); }
+      const now = new Date().toISOString();
+      const sessions = normaliseSignalSessions(licence.signal_sessions).map((session) => (
+        session.revokedAt ? session : { ...session, revokedAt: now, revokeReason: action }
+      ));
+      const events = addSignalEvent(licence.signal_events, action, "", getClientIp(req), "");
+      const updated = await client.query(`UPDATE licences SET signal_sessions = $1, signal_events = $2 WHERE id = $3 RETURNING *`, [JSON.stringify(sessions), JSON.stringify(events), licence.id]);
+      await client.query("COMMIT");
+      return json(res, 200, { ok: true, licence: mapRow(updated.rows[0]) });
+    } catch {
+      await client.query("ROLLBACK").catch(() => {});
+      return json(res, 500, { ok: false, error: "DB error" });
+    } finally { client.release(); }
   }
 
   // ── PATCH /admin/licences/:id/device-limit ─────────────────────────────
@@ -1131,6 +1366,125 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+
+  // ── SlotHawk Signal automatic device session ───────────────────────────────
+  // The Signal executable proves possession of its Windows-DPAPI RSA key.
+  // The returned JWT is short lived, server-tracked, and never persisted by
+  // either Signal or the browser extension.
+  if (req.method === "POST" && url === "/signal/challenge") {
+    const body = await readBody(req);
+    const key = String(body?.key || "").trim().toUpperCase();
+    if (!key) return json(res, 400, { ok: false, reason: "invalid" });
+    if (!checkSignalSessionRateLimit(key, getClientIp(req))) return json(res, 429, { ok: false, reason: "rate_limited" });
+    try {
+      const { rows } = await pool.query(`SELECT status, expires_at, deactivated, blocked FROM licences WHERE license_key = $1`, [key]);
+      const reason = licenceStatusReason(rows[0]);
+      if (reason) return json(res, 200, { ok: false, reason });
+      return json(res, 200, { ok: true, challenge: issueSignalChallenge(key) });
+    } catch {
+      return json(res, 500, { ok: false, reason: "signal_unavailable" });
+    }
+  }
+
+  if (req.method === "POST" && url === "/signal/authorize") {
+    const body = await readBody(req);
+    const key = String(body?.key || "").trim().toUpperCase();
+    const machineId = normalizeDeviceId(body?.machine_id);
+    const version = String(body?.version || "").replace(/[\u0000-\u001F\u007F]/g, "").slice(0, 32);
+    const ip = getClientIp(req);
+    if (!key || !SECURE_DEVICE_ID_RE.test(machineId)) return json(res, 200, { ok: false, reason: "invalid_signal_attestation" });
+    const attestation = verifySignalAttestation(body, key, machineId);
+    if (!attestation.ok) return json(res, 200, { ok: false, reason: attestation.reason });
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const locked = await client.query(`SELECT * FROM licences WHERE license_key = $1 FOR UPDATE`, [key]);
+      const licence = locked.rows[0];
+      const stateReason = licenceStatusReason(licence);
+      if (stateReason || licence?.status !== "active") {
+        await client.query("ROLLBACK");
+        return json(res, 200, { ok: false, reason: stateReason || "licence_inactive" });
+      }
+
+      const devices = activeDevices(licence.known_devices);
+      const knownDevice = devices.find((device) => device.machineId === machineId);
+      // One legacy installation may bootstrap the secure 2.0 migration. It
+      // cannot activate a second device: /migrate-device must still prove the
+      // valid legacy extension JWT before it replaces that legacy record.
+      const legacyBootstrap = !knownDevice && devices.length === 1 && isLegacyDeviceId(devices[0]?.machineId);
+      if (!knownDevice && !legacyBootstrap) {
+        await client.query("ROLLBACK");
+        return json(res, 200, { ok: false, reason: "signal_device_unregistered" });
+      }
+
+      const now = new Date();
+      const nowIso = now.toISOString();
+      const expiresAt = new Date(now.getTime() + SIGNAL_SESSION_TTL_SECONDS * 1000).toISOString();
+      const sessions = normaliseSignalSessions(licence.signal_sessions);
+      for (const session of sessions) {
+        if (!session.revokedAt && session.machineId === machineId) {
+          session.revokedAt = nowIso;
+          session.revokeReason = "replaced";
+        }
+      }
+      const sessionId = uuidv4();
+      sessions.unshift({ id: sessionId, machineId, issuedAt: nowIso, lastVerifiedAt: nowIso, expiresAt, version, ip, revokedAt: null, revokeReason: null });
+      if (sessions.length > SIGNAL_SESSION_HISTORY_LIMIT) sessions.length = SIGNAL_SESSION_HISTORY_LIMIT;
+      const events = addSignalEvent(licence.signal_events, legacyBootstrap ? "bootstrap_authorized" : "authorized", machineId, ip, version);
+      const updated = await client.query(
+        `UPDATE licences SET signal_sessions = $1, signal_events = $2 WHERE id = $3 RETURNING *`,
+        [JSON.stringify(sessions), JSON.stringify(events), licence.id]
+      );
+      await client.query("COMMIT");
+      return json(res, 200, { ok: true, token: issueSignalSession(key, machineId, sessionId), expiresAt, signalSecurity: signalSecuritySummary(updated.rows[0]) });
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
+      return json(res, 500, { ok: false, reason: "signal_unavailable" });
+    } finally { client.release(); }
+  }
+
+  if (req.method === "POST" && url === "/signal/heartbeat") {
+    const body = await readBody(req);
+    const token = String(body?.token || "").trim();
+    let decoded;
+    try { decoded = jwt.verify(token, JWT_SECRET); }
+    catch { return json(res, 200, { ok: false, reason: "signal_session_invalid" }); }
+    const key = String(decoded?.licence_key || "").trim().toUpperCase();
+    const machineId = normalizeDeviceId(decoded?.machine_id);
+    const sessionId = String(decoded?.signal_session_id || "");
+    if (decoded?.purpose !== SIGNAL_SESSION_PURPOSE || !key || !SECURE_DEVICE_ID_RE.test(machineId) || !/^[0-9a-f-]{36}$/i.test(sessionId)) {
+      return json(res, 200, { ok: false, reason: "signal_session_invalid" });
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const locked = await client.query(`SELECT * FROM licences WHERE license_key = $1 FOR UPDATE`, [key]);
+      const licence = locked.rows[0];
+      const stateReason = licenceStatusReason(licence);
+      if (stateReason || licence?.status !== "active" || !isDeviceAllowed(licence, machineId)) {
+        await client.query("ROLLBACK");
+        return json(res, 200, { ok: false, reason: stateReason || "device_removed" });
+      }
+      const sessions = normaliseSignalSessions(licence.signal_sessions);
+      const index = sessions.findIndex((session) => session.id === sessionId && session.machineId === machineId);
+      if (index < 0 || sessions[index].revokedAt) {
+        await client.query("ROLLBACK");
+        return json(res, 200, { ok: false, reason: "signal_session_invalid" });
+      }
+      const now = new Date();
+      const expiresAt = new Date(now.getTime() + SIGNAL_SESSION_TTL_SECONDS * 1000).toISOString();
+      sessions[index] = { ...sessions[index], lastVerifiedAt: now.toISOString(), expiresAt };
+      await client.query(`UPDATE licences SET signal_sessions = $1 WHERE id = $2`, [JSON.stringify(sessions), licence.id]);
+      await client.query("COMMIT");
+      return json(res, 200, { ok: true, token: issueSignalSession(key, machineId, sessionId), expiresAt });
+    } catch {
+      await client.query("ROLLBACK").catch(() => {});
+      return json(res, 500, { ok: false, reason: "signal_unavailable" });
+    } finally { client.release(); }
+  }
+
   // ── POST /device-challenge ────────────────────────────────────────────────
   // A short-lived server challenge is signed by the DPAPI-protected key inside
   // the local Signal helper. The helper's public key deterministically produces
@@ -1189,6 +1543,16 @@ const server = http.createServer(async (req, res) => {
       if (existingDevice && (!existingDevice.active || existingDevice.removedAt)) {
         await client.query("ROLLBACK");
         return json(res, 200, { ok: false, reason: "device_removed" });
+      }
+      // A brand-new device may complete its first signed activation while
+      // Signal is still checking. Existing v2 devices must present Signal's
+      // short-lived server session on every activation attempt.
+      if (existingDevice && isSecureDevice && requiresSignalSession(browserInfo)) {
+        const signalSession = verifyActiveSignalSession(body.signal_session, key, machine_id, licence.signal_sessions);
+        if (!signalSession.ok) {
+          await client.query("ROLLBACK");
+          return json(res, 200, { ok: false, reason: signalSession.reason });
+        }
       }
       if (existingDevice && isSecureDevice && hasBrowserMismatch(existingDevice, browserInfo)) {
         await client.query("ROLLBACK");
@@ -1366,6 +1730,10 @@ const server = http.createServer(async (req, res) => {
 
       const boundDevice = normaliseKnownDevices(l.known_devices).find((device) => device.machineId === boundMachineId);
       if (isSecureDevice && hasBrowserMismatch(boundDevice, browserInfo)) return json(res, 200, { ok: false, reason: "browser_mismatch" });
+      if (isSecureDevice && requiresSignalSession(browserInfo)) {
+        const signalSession = verifyActiveSignalSession(body.signal_session, decoded.license_key, boundMachineId, l.signal_sessions);
+        if (!signalSession.ok) return json(res, 200, { ok: false, reason: signalSession.reason });
+      }
 
       return json(res, 200, { ok: true, username: l.username || "", expiresAt: l.expires_at });
     } catch {
@@ -1409,6 +1777,10 @@ const server = http.createServer(async (req, res) => {
       if (!isDeviceAllowed(l, machineId)) return json(res, 200, { ok: false, reason: "device_removed" });
       const boundDevice = normaliseKnownDevices(l.known_devices).find((device) => device.machineId === machineId);
       if (isSecureDevice && hasBrowserMismatch(boundDevice, browserInfo)) return json(res, 200, { ok: false, reason: "browser_mismatch" });
+      if (isSecureDevice && requiresSignalSession(browserInfo)) {
+        const signalSession = verifyActiveSignalSession(body.signal_session, decoded.license_key, machineId, l.signal_sessions);
+        if (!signalSession.ok) return json(res, 200, { ok: false, reason: signalSession.reason });
+      }
 
       const newToken = buildLicenceToken(decoded.license_key, machineId, l.username || "", l.expires_at);
       await pool.query(`UPDATE licences SET last_seen = NOW() WHERE license_key = $1`, [decoded.license_key]);
@@ -1468,6 +1840,10 @@ const server = http.createServer(async (req, res) => {
       if (!isDeviceAllowed(licence, machine_id)) return json(res, 200, { ok: false, reason: "device_removed" });
       const boundDevice = normaliseKnownDevices(licence.known_devices).find((device) => device.machineId === machine_id);
       if (isSecureDevice && hasBrowserMismatch(boundDevice, browserInfo)) return json(res, 200, { ok: false, reason: "browser_mismatch" });
+      if (isSecureDevice && requiresSignalSession(browserInfo)) {
+        const signalSession = verifyActiveSignalSession(body.signal_session, decoded.license_key, machine_id, licence.signal_sessions);
+        if (!signalSession.ok) return json(res, 200, { ok: false, reason: signalSession.reason });
+      }
 
       const now = new Date();
 
