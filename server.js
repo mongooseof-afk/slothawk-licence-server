@@ -152,7 +152,7 @@ async function authenticateSignalToken(token) {
   const licenceKey = decoded.license_key;
   if (!licenceKey) return null;
   const { rows } = await pool.query(
-    `SELECT status, expires_at, deactivated, blocked, active, machine_id, known_devices, max_devices, username FROM licences WHERE license_key = $1`,
+    `SELECT status, expires_at, deactivated, blocked, active, machine_id, known_devices, max_devices, username, signal_sessions FROM licences WHERE license_key = $1`,
     [licenceKey]
   );
   const licence = rows[0];
@@ -1742,7 +1742,7 @@ const server = http.createServer(async (req, res) => {
       }
 
       const { rows } = await pool.query(
-        `SELECT status, expires_at, deactivated, blocked, active, machine_id, known_devices, max_devices, username FROM licences WHERE license_key = $1`,
+        `SELECT status, expires_at, deactivated, blocked, active, machine_id, known_devices, max_devices, username, signal_sessions FROM licences WHERE license_key = $1`,
         [decoded.license_key]
       );
 
@@ -1792,7 +1792,7 @@ const server = http.createServer(async (req, res) => {
       }
 
       const { rows } = await pool.query(
-        `SELECT status, expires_at, deactivated, blocked, active, machine_id, known_devices, max_devices, username FROM licences WHERE license_key = $1`,
+        `SELECT status, expires_at, deactivated, blocked, active, machine_id, known_devices, max_devices, username, signal_sessions FROM licences WHERE license_key = $1`,
         [decoded.license_key]
       );
       if (!rows.length) return json(res, 200, { ok: false, reason: "not_found" });
@@ -2116,7 +2116,7 @@ const server = http.createServer(async (req, res) => {
     // 2. Check licence status (same rules as /heartbeat)
     try {
       const { rows } = await pool.query(
-        `SELECT status, expires_at, deactivated, blocked, active, machine_id, known_devices, max_devices, username FROM licences WHERE license_key = $1`,
+        `SELECT status, expires_at, deactivated, blocked, active, machine_id, known_devices, max_devices, username, signal_sessions FROM licences WHERE license_key = $1`,
         [licenceKey]
       );
       if (!rows.length) return json(res, 403, { ok: false, reason: "invalid_licence" });
