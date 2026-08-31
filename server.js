@@ -1428,9 +1428,13 @@ const server = http.createServer(async (req, res) => {
       const locked = await client.query(`SELECT * FROM licences WHERE license_key = $1 FOR UPDATE`, [key]);
       const licence = locked.rows[0];
       const stateReason = licenceStatusReason(licence);
-      if (stateReason || licence?.status !== "active") {
+      // The shared status policy deliberately permits a pending licence so its
+      // already-registered device can complete the signed Signal bootstrap.
+      // Activation still promotes the licence to active; revoked, blocked and
+      // expired licences are rejected above.
+      if (stateReason) {
         await client.query("ROLLBACK");
-        return json(res, 200, { ok: false, reason: stateReason || "licence_inactive" });
+        return json(res, 200, { ok: false, reason: stateReason });
       }
 
       const devices = activeDevices(licence.known_devices);
@@ -1489,7 +1493,9 @@ const server = http.createServer(async (req, res) => {
       const locked = await client.query(`SELECT * FROM licences WHERE license_key = $1 FOR UPDATE`, [key]);
       const licence = locked.rows[0];
       const stateReason = licenceStatusReason(licence);
-      if (stateReason || licence?.status !== "active" || !isDeviceAllowed(licence, machineId)) {
+      // Keep the renewal rule identical to /signal/authorize. A previously
+      // accepted pending bootstrap remains usable until activation completes.
+      if (stateReason || !isDeviceAllowed(licence, machineId)) {
         await client.query("ROLLBACK");
         return json(res, 200, { ok: false, reason: stateReason || "device_removed" });
       }
