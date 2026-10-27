@@ -10,6 +10,7 @@ const jwt    = require("jsonwebtoken");
 const { Pool } = require("pg");
 const { v4: uuidv4 } = require("uuid");
 const { WebSocketServer } = require("ws");
+const { listLicenceRows } = require("./admin-collection");
 
 const PORT        = parseInt(process.env.PORT) || 8765;
 const JWT_SECRET  = process.env.JWT_SECRET;
@@ -917,7 +918,7 @@ function mapRow(r) {
     key: r.license_key, licenseKey: r.license_key, licenceKey: r.license_key, license_key: r.license_key,
     username: r.username || '',
     machineId: r.machine_id, machine_id: r.machine_id,
-    status: r.status, active: r.active, plan: r.plan, notes: r.notes || '', duration: r.duration,
+    status: !["revoked","deactivated"].includes(r.status) && r.expires_at && new Date(r.expires_at) <= new Date() ? "expired" : r.status, active: r.active, plan: r.plan, notes: r.notes || '', duration: r.duration,
     expiresAt: r.expires_at, expires_at: r.expires_at,
     createdAt: r.created_at, created_at: r.created_at,
     activatedAt: r.activated_at, activated_at: r.activated_at,
@@ -1069,7 +1070,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (req.method === "GET" && url === "/health") {
-    return json(res, 200, { status: "ok", version: "7.3.0", requiredExtensionVersion: process.env.REQUIRED_VERSION || "0.2.10" });
+    return json(res, 200, { status: "ok", version: "7.4.0", requiredExtensionVersion: process.env.REQUIRED_VERSION || "0.2.10" });
   }
   if (req.method === "GET" && url === "/version") {
     return json(res, 200, { required: process.env.REQUIRED_VERSION || "0.2.10" });
@@ -1095,7 +1096,7 @@ const server = http.createServer(async (req, res) => {
         `INSERT INTO licences (id, license_key, username, plan, status, duration, expires_at, max_devices) VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7) RETURNING *`,
         [id, key, username, plan, duration, expiresAt, requestedMaxDevices]
       );
-      console.log(`[GENERATE] key=${key}`);
+      console.log("[GENERATE] licence created");
       return json(res, 200, { ok: true, key, license_key: key, id, duration_days: duration, licences: [mapRow(rows[0])] });
     } catch (err) {
       console.error("[GENERATE] error:", err.message);
@@ -1106,9 +1107,9 @@ const server = http.createServer(async (req, res) => {
   // ── GET /admin/licences (list) ────────────────────────────────────────────
   if (req.method === "GET" && (url === "/api/admin/licences" || url === "/admin/licences")) {
     try {
-      const { rows } = await pool.query(`SELECT * FROM licences ORDER BY created_at DESC LIMIT 100`);
-      const mapped = rows.map(mapRow);
-      return json(res, 200, { data: mapped, licences: mapped, total: mapped.length, page: 1, limit: 100, totalPages: 1 });
+      const result = await listLicenceRows(pool, req.url);
+      const mapped = result.rows.map(mapRow);
+      return json(res, 200, { ...result, rows: undefined, data: mapped, licences: mapped });
     } catch (err) {
       return json(res, 500, { ok: false, error: err.message });
     }
@@ -1116,7 +1117,7 @@ const server = http.createServer(async (req, res) => {
 
 
   // ── PATCH /admin/licences/:id/signal/reset|revoke ─────────────────────────
-  if (req.method === "PATCH" && (url.endsWith("/signal/reset") || url.endsWith("/signal/revoke"))) {
+  if (req.method === "PATCH" && (/^\/(?:api\/)?admin\/licences\/[^/]+\/signal\/(?:reset|revoke)$/.test(url))) {
     const parts = url.split("/").filter(Boolean);
     const marker = parts.lastIndexOf("licences");
     const id = marker >= 0 ? parts[marker + 1] : "";
@@ -1143,7 +1144,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   // ── PATCH /admin/licences/:id/device-limit ─────────────────────────────
-  if (req.method === "PATCH" && url.endsWith("/device-limit")) {
+  if (req.method === "PATCH" && /^\/(?:api\/)?admin\/licences\/[^/]+\/device-limit$/.test(url)) {
     const id = extractIdFromUrl(url);
     const body = await readBody(req);
     const requestedMaxDevices = parseRequestedDeviceLimit(body.maxDevices ?? body.max_devices);
@@ -1169,7 +1170,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   // ── PATCH /admin/licences/:id/devices/remove ────────────────────────────
-  if (req.method === "PATCH" && url.endsWith("/devices/remove")) {
+  if (req.method === "PATCH" && /^\/(?:api\/)?admin\/licences\/[^/]+\/devices\/remove$/.test(url)) {
     const parts = url.split("/").filter(Boolean);
     const deviceIndex = parts.lastIndexOf("devices");
     const id = deviceIndex > 0 ? parts[deviceIndex - 1] : "";
@@ -1196,7 +1197,7 @@ const server = http.createServer(async (req, res) => {
     } finally { client.release(); }
   }
   // ── PATCH /admin/licences/:id/devices/restore ───────────────────────────
-  if (req.method === "PATCH" && url.endsWith("/devices/restore")) {
+  if (req.method === "PATCH" && /^\/(?:api\/)?admin\/licences\/[^/]+\/devices\/restore$/.test(url)) {
     const parts = url.split("/").filter(Boolean);
     const devicesIndex = parts.lastIndexOf("devices");
     const id = devicesIndex > 0 ? parts[devicesIndex - 1] : "";
@@ -1242,7 +1243,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   // ── PATCH /admin/licences/:id/username ────────────────────────────────────
-  if (req.method === "PATCH" && url.endsWith("/username")) {
+  if (req.method === "PATCH" && /^\/(?:api\/)?admin\/licences\/[^/]+\/username$/.test(url)) {
     const id = extractIdFromUrl(url);
     const body = await readBody(req);
     const username = typeof body.username === "string" ? body.username.trim().replace(/\s+/g, " ") : "";
@@ -1262,7 +1263,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   // ── PATCH /admin/licences/:id/revoke ──────────────────────────────────────
-  if (req.method === "PATCH" && url.includes("/revoke")) {
+  if (req.method === "PATCH" && /^\/(?:api\/)?admin\/licences\/[^/]+\/revoke$/.test(url)) {
     const id = extractIdFromUrl(url);
     try {
       const result = await pool.query(`UPDATE licences SET status = 'revoked', active = FALSE, blocked = TRUE WHERE id = $1 OR license_key = $1 RETURNING license_key`, [id]);
@@ -1273,7 +1274,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   // ── PATCH /admin/licences/:id/reset-machine ───────────────────────────────
-  if (req.method === "PATCH" && url.includes("/reset-machine")) {
+  if (req.method === "PATCH" && /^\/(?:api\/)?admin\/licences\/[^/]+\/reset-machine$/.test(url)) {
     const id = extractIdFromUrl(url);
     try {
       const result = await pool.query(`UPDATE licences SET machine_id = NULL, status = 'pending', active = FALSE, blocked = FALSE, suspicious = FALSE, suspicious_reason = NULL, known_devices = '[]' WHERE id = $1 OR license_key = $1 RETURNING license_key`, [id]);
@@ -1284,7 +1285,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   // ── PATCH /admin/licences/:id/reactivate ──────────────────────────────────
-  if (req.method === "PATCH" && url.includes("/reactivate")) {
+  if (req.method === "PATCH" && /^\/(?:api\/)?admin\/licences\/[^/]+\/reactivate$/.test(url)) {
     const id = extractIdFromUrl(url);
     try {
       const result = await pool.query(`UPDATE licences SET status = CASE WHEN machine_id IS NOT NULL THEN 'active' ELSE 'pending' END, active = TRUE, deactivated = FALSE, blocked = FALSE, suspicious = FALSE, suspicious_reason = NULL WHERE id = $1 OR license_key = $1`, [id]);
@@ -1294,7 +1295,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   // ── PATCH /admin/licences/:id/deactivate ──────────────────────────────────
-  if (req.method === "PATCH" && url.includes("/deactivate")) {
+  if (req.method === "PATCH" && /^\/(?:api\/)?admin\/licences\/[^/]+\/deactivate$/.test(url)) {
     const id = extractIdFromUrl(url);
     try {
       const result = await pool.query(`UPDATE licences SET status = 'deactivated', active = FALSE, deactivated = TRUE WHERE id = $1 OR license_key = $1 RETURNING license_key`, [id]);
@@ -1305,7 +1306,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   // ── PATCH /admin/licences/:id/clear-block ─────────────────────────────────
-  if (req.method === "PATCH" && url.includes("/clear-block")) {
+  if (req.method === "PATCH" && /^\/(?:api\/)?admin\/licences\/[^/]+\/clear-block$/.test(url)) {
     const id = extractIdFromUrl(url);
     try {
       // Clear Block is the operator's "let this user continue" action.
@@ -1335,7 +1336,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   // ── PATCH /admin/licences/:id/extend ──────────────────────────────────────
-  if (req.method === "PATCH" && url.includes("/extend")) {
+  if (req.method === "PATCH" && /^\/(?:api\/)?admin\/licences\/[^/]+\/extend$/.test(url)) {
     const id = extractIdFromUrl(url);
     const body = await readBody(req);
     const days = parseInt(body.days) || 30;
@@ -1350,7 +1351,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   // ── GET /admin/licences/:id (detail) ──────────────────────────────────────
-  if (req.method === "GET" && (url.match(/\/api\/admin\/licences\/.+/) || url.match(/\/admin\/licences\/.+/))) {
+  if (req.method === "GET" && (/^\/(?:api\/)?admin\/licences\/[^/]+$/.test(url))) {
     const id = url.split("/").pop();
     try {
       const { rows } = await pool.query(`SELECT * FROM licences WHERE id = $1 OR license_key = $1`, [id]);
@@ -1624,7 +1625,7 @@ const server = http.createServer(async (req, res) => {
 
       await client.query("COMMIT");
       const token = buildLicenceToken(key, machine_id, licence.username || "", expiresAt);
-      console.log("[ACTIVATE] OK key=" + key + " device=" + machine_id.slice(0, 12));
+      console.log("[ACTIVATE] device=" + machine_id.slice(0, 12));
       return json(res, 200, { ok: true, token, username: licence.username || "", expiresAt: expiresAt instanceof Date ? expiresAt.toISOString() : expiresAt });
     } catch (err) {
       await client.query("ROLLBACK").catch(() => {});
@@ -1713,7 +1714,7 @@ const server = http.createServer(async (req, res) => {
 
       const expiresAt = licence.expires_at;
       const nextToken = buildLicenceToken(key, machineId, licence.username || "", expiresAt);
-      console.log("[MIGRATE] OK key=" + key + " device=" + machineId.slice(0, 12));
+      console.log("[MIGRATE] device=" + machineId.slice(0, 12));
       return json(res, 200, { ok: true, token: nextToken, username: licence.username || "", expiresAt });
     } catch (err) {
       await client.query("ROLLBACK").catch(() => {});

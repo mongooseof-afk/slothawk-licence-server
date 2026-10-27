@@ -1,7 +1,7 @@
 {
   "name": "slothawk_license_server",
-  "version": "7.0.0",
-  "description": "SlotHawk Licence Server v7",
+  "version": "7.4.0",
+  "description": "SlotHawk Licence Server v7.4",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
