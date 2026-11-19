@@ -11,6 +11,7 @@ const { Pool } = require("pg");
 const { v4: uuidv4 } = require("uuid");
 const { WebSocketServer } = require("ws");
 const { listLicenceRows } = require("./admin-collection");
+const { createPaymentNotifications } = require("./payment-notifications");
 
 const PORT        = parseInt(process.env.PORT) || 8765;
 const JWT_SECRET  = process.env.JWT_SECRET;
@@ -234,6 +235,9 @@ if (!JWT_SECRET) { console.error("FATAL: JWT_SECRET missing"); process.exit(1); 
 const pool = process.env.DATABASE_URL
   ? new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } })
   : new Pool({ host: process.env.DB_HOST, port: parseInt(process.env.DB_PORT), database: process.env.DB_NAME, user: process.env.DB_USER, password: process.env.DB_PASSWORD });
+
+const paymentNotifications = createPaymentNotifications({pool, verifyToken:token=>jwt.verify(token,JWT_SECRET), isDeviceAllowed,
+  token:TELEGRAM_BOT_TOKEN, chatId:process.env.TELEGRAM_PAYMENT_CHAT_ID || ''});
 
 async function initDB() {
   await pool.query(`
@@ -1947,6 +1951,19 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  // Private admin payment notifications. Destination and username are server-owned.
+  if (req.method === 'POST' && url === '/payment-notifications') {
+    try {
+      const raw=await readRawBody(req,16384);
+      let body;try{body=JSON.parse(raw.toString('utf8'));}catch{return json(res,400,{ok:false,reason:'invalid_json'});}
+      const result=await paymentNotifications.accept(body);
+      if(result.ok)void paymentNotifications.deliver().catch(()=>console.warn('[PAYMENT] Delivery unavailable'));
+      return json(res,result.status,{ok:!!result.ok,...(result.reason?{reason:result.reason}:{})});
+    } catch(error) {
+      return json(res,error?.code==='PAYLOAD_TOO_LARGE'?413:503,{ok:false,reason:'payment_notification_unavailable'});
+    }
+  }
+
   // ── POST /booking-events ─────────────────────────────────────────────────
   // The extension reports only a confirmed result: payment-link extracted or
   // waitlist confirmed. The timestamp and client IP are assigned server-side;
@@ -2315,7 +2332,9 @@ async function cleanupVpsSignalEvents() {
   }
 }
 
-initDB().then(() => {
+initDB().then(async () => {
+  await paymentNotifications.initialize();
+  setInterval(()=>{void paymentNotifications.deliver().catch(()=>console.warn('[PAYMENT] Delivery unavailable'));},2000).unref?.();
   setInterval(() => { void cleanupVpsSignalEvents(); }, 60 * 60_000).unref?.();
   server.listen(PORT, "0.0.0.0", () => {
     console.log(`SlotHawk API -> port ${PORT}`);
